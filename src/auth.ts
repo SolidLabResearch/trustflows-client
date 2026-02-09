@@ -12,6 +12,7 @@ import {
 
 export interface AuthOptions {
   fetch?: typeof fetch;
+  redirect?: (url: string) => void;
   storage?: Storage;
   claimResolvers?: ClaimResolverRegistry;
   persistTokens?: boolean;
@@ -39,6 +40,7 @@ export class Auth {
   public umaPermissionTokens = new Map<string, UmaTokenCacheEntry>();
 
   private readonly fetchFn: typeof fetch;
+  private readonly redirectFn: (url: string) => void;
   private readonly storage?: Storage;
   private readonly claimResolvers: ClaimResolverRegistry;
   private readonly persistTokens: boolean;
@@ -47,6 +49,9 @@ export class Auth {
   public constructor(options: AuthOptions = {}) {
     const rawFetch = options.fetch ?? fetch;
     this.fetchFn = rawFetch === fetch ? rawFetch.bind(globalThis) : rawFetch;
+    this.redirectFn = options.redirect ?? ((url: string): void => {
+      window.location.href = url;
+    });
     this.storage =
       options.storage ??
       (typeof sessionStorage === 'undefined' ? undefined : sessionStorage);
@@ -120,7 +125,7 @@ export class Auth {
       response_mode: 'query',
     });
 
-    window.location.href = `${config.authorization_endpoint}?${params.toString()}`;
+    this.redirectFn(`${config.authorization_endpoint}?${params.toString()}`);
   }
 
   public async logout(postLogoutRedirectUri: string): Promise<void> {
@@ -154,7 +159,7 @@ export class Auth {
       `${config.end_session_endpoint}?${params.toString()}` :
       config.end_session_endpoint;
 
-    window.location.href = logoutUrl;
+    this.redirectFn(logoutUrl);
   }
 
   public async handleIncomingRedirect(): Promise<boolean> {

@@ -5,17 +5,9 @@ import { createMockFetch } from './helpers/mockFetch';
 import { MemoryStorage } from './helpers/storage';
 import { oidcConfig } from './fixtures/servers';
 
-function installBrowserGlobals(): { location: { href: string }} {
-  const location = { href: 'http://localhost:5173/temp-client/app/' };
-  globalThis.window = {
-    location,
-  } as unknown as Window;
-  return { location };
-}
-
 describe('Auth.logout', (): void => {
   it('clears tokens and redirects to the end_session_endpoint', async(): Promise<void> => {
-    const { location } = installBrowserGlobals();
+    let redirectedTo: string | undefined;
     const storage = new MemoryStorage();
     storage.setItem('oidc_issuer', 'http://localhost:3000');
     storage.setItem('oidc_redirect_uri', 'http://localhost:5173/temp-client/app/');
@@ -34,7 +26,13 @@ describe('Auth.logout', (): void => {
       },
     ]);
 
-    const auth = new Auth({ fetch: fetchMock, storage });
+    const auth = new Auth({
+      fetch: fetchMock,
+      redirect: (url: string): void => {
+        redirectedTo = url;
+      },
+      storage,
+    });
     auth.oidcToken = 'id-token';
     auth.oidcAccessToken = 'access-token';
 
@@ -42,8 +40,8 @@ describe('Auth.logout', (): void => {
 
     expect(auth.oidcToken).toBeUndefined();
     expect(auth.oidcAccessToken).toBeUndefined();
-    expect(location.href).toContain('http://localhost:3000/.oidc/session/end');
-    expect(location.href).toContain('post_logout_redirect_uri=');
-    expect(location.href).toContain('id_token_hint=');
+    expect(redirectedTo).toContain('http://localhost:3000/.oidc/session/end');
+    expect(redirectedTo).toContain('post_logout_redirect_uri=');
+    expect(redirectedTo).toContain('id_token_hint=');
   });
 });

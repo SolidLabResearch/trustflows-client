@@ -2,37 +2,24 @@
 import { describe, expect, it } from 'vitest';
 import { Auth } from '../src';
 import { createMockFetch } from './helpers/mockFetch';
+import { installBrowserGlobals } from './helpers/browserGlobals';
 import { MemoryStorage } from './helpers/storage';
 import { oidcConfig, oidcToken, webId } from './fixtures/servers';
 
-function installBrowserGlobals(url: string): void {
-  globalThis.window = {
-    location: { href: url },
-    history: {
-      replaceState: (...args: unknown[]): void => {
-        void args;
-      },
-    },
-  } as unknown as Window;
-  globalThis.document = { title: 'Temp client tests' } as Document;
-  globalThis.atob = (value: string): string =>
-    Buffer.from(value, 'base64').toString('binary');
-  globalThis.btoa = (value: string): string =>
-    Buffer.from(value, 'binary').toString('base64');
-}
-
 describe('Auth.handleIncomingRedirect', (): void => {
   it('exchanges the auth code and stores tokens', async(): Promise<void> => {
-    installBrowserGlobals(
-      'http://localhost:5173/temp-client/app/?code=test-code&state=test-state',
-    );
+    const { location } = installBrowserGlobals({
+      url: 'http://localhost:5173/temp-client/app/?code=test-code&state=test-state',
+    });
+    const redirectUri = new URL('/temp-client/app/', location.href).toString();
+    const clientId = new URL('client-id.jsonld', redirectUri).toString();
 
     const storage = new MemoryStorage();
     storage.setItem('oidc_state', 'test-state');
     storage.setItem('oidc_code_verifier', 'verifier-123');
     storage.setItem('oidc_issuer', 'http://localhost:3000');
-    storage.setItem('oidc_client_id', 'http://localhost:5173/temp-client/app/client-id.jsonld');
-    storage.setItem('oidc_redirect_uri', 'http://localhost:5173/temp-client/app/');
+    storage.setItem('oidc_client_id', clientId);
+    storage.setItem('oidc_redirect_uri', redirectUri);
 
     const fetchMock = createMockFetch([
       {
