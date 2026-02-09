@@ -49,5 +49,5 @@ export function installBrowserGlobals({
 
   document.title = documentTitle;
 
-  return { location: window.location as { href: string } };
+  return { location: window.location as { href: string }};
 }

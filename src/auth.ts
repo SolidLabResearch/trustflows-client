@@ -45,6 +45,7 @@ export class Auth {
   private readonly claimResolvers: ClaimResolverRegistry;
   private readonly persistTokens: boolean;
   private oidcIssuer?: string;
+  private handleRedirectPromise?: Promise<boolean>;
 
   public constructor(options: AuthOptions = {}) {
     const rawFetch = options.fetch ?? fetch;
@@ -163,76 +164,91 @@ export class Auth {
   }
 
   public async handleIncomingRedirect(): Promise<boolean> {
-    const url = new URL(window.location.href);
-    const code = url.searchParams.get('code');
-    const state = url.searchParams.get('state');
-    if (!code) {
-      return false;
+    if (this.handleRedirectPromise) {
+      return this.handleRedirectPromise;
     }
 
-    const storage = this.getStorage();
-    const storedState = storage.getItem('oidc_state');
-    if (!state || state !== storedState) {
-      throw new Error('OIDC state mismatch');
+    this.handleRedirectPromise = (async(): Promise<boolean> => {
+      const url = new URL(window.location.href);
+      const code = url.searchParams.get('code');
+      const state = url.searchParams.get('state');
+      if (!code) {
+        return false;
+      }
+
+      const storage = this.getStorage();
+      const storedState = storage.getItem('oidc_state');
+      if (!state || state !== storedState) {
+        throw new Error('OIDC state mismatch');
+      }
+
+      const issuer = storage.getItem('oidc_issuer');
+      const clientId = storage.getItem('oidc_client_id');
+      const redirectUri = storage.getItem('oidc_redirect_uri');
+      const codeVerifier = storage.getItem('oidc_code_verifier');
+      if (!issuer || !clientId || !redirectUri || !codeVerifier) {
+        throw new Error('Missing stored OIDC parameters');
+      }
+      this.oidcIssuer = issuer;
+
+      const config = await this.getOidcConfig(issuer);
+      if (!config.token_endpoint) {
+        throw new Error('Missing token_endpoint in OIDC configuration');
+      }
+
+      const bodyParams = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        code_verifier: codeVerifier,
+      });
+
+      const tokenResp = await this.fetchFn(config.token_endpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: bodyParams.toString(),
+      });
+
+      if (!tokenResp.ok) {
+        throw new Error(`Token endpoint error ${tokenResp.status}`);
+      }
+
+      const tokenJson = (await tokenResp.json()) as {
+        access_token?: string;
+        id_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+
+      this.oidcAccessToken = tokenJson.access_token;
+      this.oidcToken = tokenJson.id_token;
+      this.oidcRefreshToken = tokenJson.refresh_token;
+      if (tokenJson.expires_in) {
+        this.oidcTokenExpiry = Date.now() + tokenJson.expires_in * 1000;
+      }
+      if (tokenJson.id_token) {
+        this.webId = this.extractWebId(tokenJson.id_token);
+      }
+      this.persistOidcTokens();
+
+      window.history.replaceState({}, document.title, redirectUri);
+      return true;
+    })();
+
+    try {
+      return await this.handleRedirectPromise;
+    } finally {
+      this.handleRedirectPromise = undefined;
     }
-
-    const issuer = storage.getItem('oidc_issuer');
-    const clientId = storage.getItem('oidc_client_id');
-    const redirectUri = storage.getItem('oidc_redirect_uri');
-    const codeVerifier = storage.getItem('oidc_code_verifier');
-    if (!issuer || !clientId || !redirectUri || !codeVerifier) {
-      throw new Error('Missing stored OIDC parameters');
-    }
-    this.oidcIssuer = issuer;
-
-    const config = await this.getOidcConfig(issuer);
-    if (!config.token_endpoint) {
-      throw new Error('Missing token_endpoint in OIDC configuration');
-    }
-
-    const bodyParams = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: redirectUri,
-      client_id: clientId,
-      code_verifier: codeVerifier,
-    });
-
-    const tokenResp = await this.fetchFn(config.token_endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded',
-      },
-      body: bodyParams.toString(),
-    });
-
-    if (!tokenResp.ok) {
-      throw new Error(`Token endpoint error ${tokenResp.status}`);
-    }
-
-    const tokenJson = (await tokenResp.json()) as {
-      access_token?: string;
-      id_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-
-    this.oidcAccessToken = tokenJson.access_token;
-    this.oidcToken = tokenJson.id_token;
-    this.oidcRefreshToken = tokenJson.refresh_token;
-    if (tokenJson.expires_in) {
-      this.oidcTokenExpiry = Date.now() + tokenJson.expires_in * 1000;
-    }
-    if (tokenJson.id_token) {
-      this.webId = this.extractWebId(tokenJson.id_token);
-    }
-    this.persistOidcTokens();
-
-    window.history.replaceState({}, document.title, redirectUri);
-    return true;
   }
 
   public async isLoggedIn(): Promise<boolean> {
+    if (this.handleRedirectPromise) {
+      await this.handleRedirectPromise;
+    }
     try {
       await this.ensureValidToken();
     } catch {
