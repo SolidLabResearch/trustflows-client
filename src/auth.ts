@@ -45,7 +45,8 @@ export class Auth {
   private oidcIssuer?: string;
 
   public constructor(options: AuthOptions = {}) {
-    this.fetchFn = (options.fetch ?? fetch).bind(globalThis);
+    const rawFetch = options.fetch ?? fetch;
+    this.fetchFn = rawFetch === fetch ? rawFetch.bind(globalThis) : rawFetch;
     this.storage =
       options.storage ??
       (typeof sessionStorage === 'undefined' ? undefined : sessionStorage);
