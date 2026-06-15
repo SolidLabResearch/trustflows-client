@@ -11,7 +11,7 @@ import type {
   Claim as UmaClaimToken,
 } from './types';
 import type { RequiredClaims } from './claims/types';
-import { gatherClaims } from './claims/registry';
+import { resolveClaimResolver } from './claims/registry';
 import {
   ID_TOKEN_CLAIM_FORMAT,
   ID_TOKEN_CLAIM_FORMAT_URN,
@@ -169,18 +169,11 @@ export async function fetchAccessToken(
       );
     }
 
-    let nextRequired: RequiredClaims | undefined;
-    let nextKey: string | undefined;
-    for (const claim of requiredClaims) {
-      const key = buildClaimKey(claim);
-      if (!pushedClaimKeys.has(key)) {
-        nextRequired = claim;
-        nextKey = key;
-        break;
-      }
-    }
+    const pending = requiredClaims.filter(
+      (claim): boolean => !pushedClaimKeys.has(buildClaimKey(claim)),
+    );
 
-    if (!nextRequired || !nextKey) {
+    if (pending.length === 0) {
       throw new Error(
         `UMA server requested claims that were already pushed: ${JSON.stringify(
           requiredClaims,
@@ -188,25 +181,48 @@ export async function fetchAccessToken(
       );
     }
 
-    pushedClaimKeys.add(nextKey);
-
-    const resolved = await gatherClaims(
-      [],
-      [ nextRequired ],
-      auth,
-      auth.getClaimResolvers(),
-    );
-
-    if (resolved.length === 0) {
-      throw new Error('No resolver produced a claim for the required claim.');
+    const resolvers = auth.getClaimResolvers();
+    const nextRequired = pending[0];
+    const resolver = resolveClaimResolver(nextRequired, resolvers);
+    if (!resolver) {
+      throw new Error(
+        `No claim resolver matched required claim: ${JSON.stringify(
+          nextRequired,
+        )}`,
+      );
     }
 
-    const nextClaim = resolved[0];
-    if (!nextClaim?.claim_token || !nextClaim.claim_token_format) {
+    let resolvedClaim: UmaClaimToken | undefined;
+    const handledClaims: RequiredClaims[] = [];
+
+    const { groupBy, resolveGroup } = resolver;
+    if (groupBy && resolveGroup) {
+      // The resolver opted in to combining several required claims that it
+      // matches and that share the same group key into a single resolution
+      // (e.g. all access-token permissions for the same issuer). This stays
+      // generic so external resolvers can use it too.
+      const groupKey = groupBy(nextRequired);
+      const group = pending.filter(
+        (claim): boolean =>
+          resolveClaimResolver(claim, resolvers) === resolver &&
+          groupBy(claim) === groupKey,
+      );
+      resolvedClaim = await resolveGroup(group, auth);
+      handledClaims.push(...group);
+    } else {
+      resolvedClaim = await resolver.resolve(nextRequired, auth);
+      handledClaims.push(nextRequired);
+    }
+
+    if (!resolvedClaim?.claim_token || !resolvedClaim.claim_token_format) {
       throw new Error('Resolved claim is missing claim_token or format.');
     }
 
-    pendingClaim = nextClaim;
+    for (const claim of handledClaims) {
+      pushedClaimKeys.add(buildClaimKey(claim));
+    }
+
+    pendingClaim = resolvedClaim;
     if (typeof currentRequest === 'string' && errorPayload.ticket) {
       currentRequest = errorPayload.ticket;
     }
@@ -255,37 +271,31 @@ export async function fetchWithUma(
   });
 }
 
-function normalizeClaimValue(
-  value: string | string[] | undefined,
-): string | string[] | undefined {
-  if (!value) {
-    return undefined;
-  }
+function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
-    return [ ...value ].sort();
+    // Treat array fields (scopes, issuers, ...) as order-independent sets.
+    return `[${value.map(stableStringify).sort().join(',')}]`;
   }
-  return value;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([ , entryValue ]): boolean => entryValue !== undefined)
+      .map(([ key, entryValue ]): [string, string] =>
+        [ key, stableStringify(entryValue) ])
+      .sort(([ a ], [ b ]): number => a.localeCompare(b));
+    return `{${entries
+      .map(([ key, entryValue ]): string => `${JSON.stringify(key)}:${entryValue}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }
 
+/**
+ * Builds a stable, content-based key for a required claim. The key covers every
+ * field of the claim (including fields used by external resolvers), so that two
+ * genuinely different required claims never collide.
+ */
 function buildClaimKey(claim: RequiredClaims): string {
-  const entries: [string, string | string[]][] = [];
-  const normalized = {
-    claim_token_format: normalizeClaimValue(claim.claim_token_format),
-    claim_type: normalizeClaimValue(claim.claim_type),
-    issuer: normalizeClaimValue(claim.issuer),
-    name: claim.name,
-    friendly_name: claim.friendly_name,
-  };
-
-  for (const [ key, value ] of Object.entries(normalized)) {
-    if (value === undefined) {
-      continue;
-    }
-    entries.push([ key, value ]);
-  }
-
-  entries.sort(([ a ], [ b ]): number => a.localeCompare(b));
-  return JSON.stringify(Object.fromEntries(entries));
+  return stableStringify(claim);
 }
 
 function seedIdTokenClaims(pushedClaimKeys: Set<string>): void {

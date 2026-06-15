@@ -31,6 +31,16 @@ export interface RequiredClaims extends JsonObject {
    * A human-friendly name for the claim.
    */
   friendly_name?: string;
+
+  /**
+   * The identifier of the resource an access-token claim is derived from.
+   */
+  derivation_resource_id?: string;
+
+  /**
+   * The scopes requested for an access-token claim.
+   */
+  resource_scopes?: string[];
 }
 
 /**
@@ -38,6 +48,16 @@ export interface RequiredClaims extends JsonObject {
  */
 export type ClaimResolver = (
   required: RequiredClaims,
+  auth: Auth,
+) => Promise<Claim | undefined> | Claim | undefined;
+
+/**
+ * Resolves a group of required claims (sharing the same group key) into a
+ * single claim token. Used to combine multiple required claims into one
+ * resolution, e.g. all access-token permissions for the same issuer.
+ */
+export type ClaimGroupResolver = (
+  required: RequiredClaims[],
   auth: Auth,
 ) => Promise<Claim | undefined> | Claim | undefined;
 
@@ -74,6 +94,20 @@ export interface ClaimResolverDefinition {
    * Resolver implementation.
    */
   resolve: ClaimResolver;
+
+  /**
+   * Optional grouping key. Required claims matched by this resolver that share
+   * the same group key can be resolved together in a single call via
+   * `resolveGroup`. Resolvers that do not set this are resolved one claim at a
+   * time. External resolvers can opt in to combine related claims.
+   */
+  groupBy?: (required: RequiredClaims) => string | undefined;
+
+  /**
+   * Optional batch resolver. When provided together with `groupBy`, a group of
+   * required claims sharing the same group key is resolved into a single claim.
+   */
+  resolveGroup?: ClaimGroupResolver;
 }
 
 export type ClaimResolverRegistry = ClaimResolverDefinition[];

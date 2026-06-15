@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { describe, expect, it } from 'vitest';
 import type { Auth, Claim, ClaimResolverDefinition } from '../src';
-import { fetchAccessToken, ID_TOKEN_CLAIM_FORMAT } from '../src';
+import { createDefaultClaimResolvers, fetchAccessToken, ID_TOKEN_CLAIM_FORMAT } from '../src';
 
 function makeAuth(
   fetchFn: typeof fetch,
@@ -12,6 +12,16 @@ function makeAuth(
     createClaimToken: async(): Promise<string> => 'id-token',
     getClaimResolvers: (): ClaimResolverDefinition[] => resolvers,
   } as unknown as Auth;
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.href;
+  }
+  return input.url;
 }
 
 describe('fetchAccessToken', (): void => {
@@ -97,5 +107,229 @@ describe('fetchAccessToken', (): void => {
     await expect(
       fetchAccessToken(auth, 'https://as.example/token', 't1'),
     ).rejects.toThrow(/already pushed/u);
+  });
+
+  // Replication test for the bug where an auth server requests multiple
+  // access-token claims that only differ by the targeted resource
+  // (derivation_resource_id / resource_scopes) but share the same
+  // claim_type and issuer. These permissions should be combined into a
+  // single token request to the shared issuer and satisfied with one claim
+  // token, instead of failing with an "already pushed" error.
+  it('combines multiple access-token permissions for the same issuer', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const ACCESS_TOKEN_FORMAT = 'urn:ietf:params:oauth:token-type:access_token';
+
+    const resourceServer = 'https://rs.example/token';
+    const issuer = 'https://as.example';
+    const issuerTokenEndpoint = `${issuer}/token`;
+
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'res-A',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'res-B',
+        resource_scopes: [ 'write' ],
+      },
+    ];
+
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body: Record<string, unknown> = init?.body ?
+          (JSON.parse(init.body as string) as Record<string, unknown>) :
+          {};
+      calls.push({ url, body });
+
+      // The shared issuer grants a single access token covering all
+      // requested permissions in one round trip.
+      if (url === issuerTokenEndpoint) {
+        return new Response(
+          JSON.stringify({ access_token: 'combined-access', token_type: 'Bearer' }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      const resourceServerCalls = calls.filter(
+        (call): boolean => call.url === resourceServer,
+      );
+
+      // The resource server first asks for the two access-token claims, then
+      // grants the token once the combined claim token has been pushed.
+      if (resourceServerCalls.length === 1) {
+        return new Response(
+          JSON.stringify({
+            error: 'need_info',
+            required_claims: requiredClaims,
+            ticket: 't2',
+          }),
+          { status: 403, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ access_token: 'access-final', token_type: 'Bearer' }),
+        { status: 200, headers: { 'content-type': 'application/json' }},
+      );
+    };
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+
+    const result = await fetchAccessToken(auth, resourceServer, 't1');
+
+    expect(result).toEqual({
+      access_token: 'access-final',
+      token_type: 'Bearer',
+    });
+
+    const issuerCalls = calls.filter(
+      (call): boolean => call.url === issuerTokenEndpoint,
+    );
+    const resourceServerCalls = calls.filter(
+      (call): boolean => call.url === resourceServer,
+    );
+
+    // The issuer is contacted exactly once, with both permissions combined.
+    expect(issuerCalls).toHaveLength(1);
+    expect(issuerCalls[0].body.permissions).toEqual([
+      { resource_id: 'res-A', resource_scopes: [ 'read' ]},
+      { resource_id: 'res-B', resource_scopes: [ 'write' ]},
+    ]);
+
+    // The resource server is satisfied with a single combined claim token.
+    expect(resourceServerCalls).toHaveLength(2);
+    expect(resourceServerCalls[1].body).toMatchObject({
+      ticket: 't2',
+      claim_token: 'combined-access',
+      claim_token_format: ACCESS_TOKEN_FORMAT,
+    });
+  });
+
+  // Extensibility: an external (custom) resolver that matches several distinct
+  // required claims must resolve them one at a time without colliding, even
+  // when they only differ by a custom field the package knows nothing about.
+  it('resolves multiple distinct claims from an external resolver one at a time', async(): Promise<void> => {
+    const calls: { body: Record<string, unknown> }[] = [];
+
+    const requiredClaims = [
+      { claim_type: 'custom-claim', resource: 'alpha' },
+      { claim_type: 'custom-claim', resource: 'beta' },
+    ];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const body: Record<string, unknown> = init?.body ?
+          (JSON.parse(init.body as string) as Record<string, unknown>) :
+          {};
+      calls.push({ body });
+
+      if (calls.length < 3) {
+        return new Response(
+          JSON.stringify({
+            error: 'need_info',
+            required_claims: requiredClaims,
+            ticket: `t${calls.length + 1}`,
+          }),
+          { status: 403, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ access_token: 'access-final', token_type: 'Bearer' }),
+        { status: 200, headers: { 'content-type': 'application/json' }},
+      );
+    };
+
+    const resolvers: ClaimResolverDefinition[] = [
+      {
+        id: 'custom',
+        match: { claim_type: 'custom-claim' },
+        resolve: (required): Claim => ({
+          claim_token: `custom-${String(
+            (required as Record<string, unknown>).resource,
+          )}`,
+          claim_token_format: 'urn:example:custom',
+        }),
+      },
+    ];
+
+    const auth = makeAuth(fetchMock, resolvers);
+
+    const result = await fetchAccessToken(auth, 'https://rs.example/token', 't1');
+
+    expect(result).toEqual({ access_token: 'access-final', token_type: 'Bearer' });
+
+    // Each distinct custom claim is pushed on its own round trip.
+    expect(calls).toHaveLength(3);
+    expect(calls[1].body).toMatchObject({ claim_token: 'custom-alpha' });
+    expect(calls[2].body).toMatchObject({ claim_token: 'custom-beta' });
+  });
+
+  // Extensibility: an external resolver can opt in to combining related claims
+  // by providing `groupBy` and `resolveGroup`, exactly like the built-in
+  // access-token resolver does.
+  it('lets an external resolver combine related claims via groupBy/resolveGroup', async(): Promise<void> => {
+    const calls: { body: Record<string, unknown> }[] = [];
+
+    const requiredClaims = [
+      { claim_type: 'custom-claim', issuer: 'https://issuer.example', resource: 'alpha' },
+      { claim_type: 'custom-claim', issuer: 'https://issuer.example', resource: 'beta' },
+    ];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const body: Record<string, unknown> = init?.body ?
+          (JSON.parse(init.body as string) as Record<string, unknown>) :
+          {};
+      calls.push({ body });
+
+      if (calls.length === 1) {
+        return new Response(
+          JSON.stringify({
+            error: 'need_info',
+            required_claims: requiredClaims,
+            ticket: 't2',
+          }),
+          { status: 403, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ access_token: 'access-final', token_type: 'Bearer' }),
+        { status: 200, headers: { 'content-type': 'application/json' }},
+      );
+    };
+
+    const resolvers: ClaimResolverDefinition[] = [
+      {
+        id: 'custom-group',
+        match: { claim_type: 'custom-claim' },
+        resolve: (): Claim | undefined => undefined,
+        groupBy: (required): string | undefined =>
+          required.issuer as string | undefined,
+        resolveGroup: (claims): Claim => ({
+          claim_token: `custom-${claims
+            .map((claim): string => String(
+              (claim as Record<string, unknown>).resource,
+            ))
+            .join('+')}`,
+          claim_token_format: 'urn:example:custom',
+        }),
+      },
+    ];
+
+    const auth = makeAuth(fetchMock, resolvers);
+
+    const result = await fetchAccessToken(auth, 'https://rs.example/token', 't1');
+
+    expect(result).toEqual({ access_token: 'access-final', token_type: 'Bearer' });
+
+    // Both claims for the same issuer are combined into a single round trip.
+    expect(calls).toHaveLength(2);
+    expect(calls[1].body).toMatchObject({ claim_token: 'custom-alpha+beta' });
   });
 });
