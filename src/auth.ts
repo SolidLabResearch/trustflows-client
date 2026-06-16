@@ -108,6 +108,13 @@ export class Auth {
     this.oidcAccessToken = value;
   }
 
+  /**
+   * The OIDC issuer the user logged in with, if known.
+   */
+  public get issuer(): string | undefined {
+    return this.oidcIssuer ?? this.storage?.getItem('oidc_issuer') ?? undefined;
+  }
+
   public async login(
     issuer: string,
     clientId: string,

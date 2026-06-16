@@ -159,3 +159,149 @@ The `id` field must be unique among all registered claim resolvers and is used f
 string, RegExp, or a predicate function. The `priority` field is used to determine the order in which resolvers are
 tried (higher priority first). The `resolve` function is called when the resolver matches a claim request. It receives
 the required claim and the auth entry that can be used to create the claim.
+
+## Aggregators
+
+The `Aggregator` class manages a single Aggregator Instance on an Aggregator Server: it discovers or
+creates the instance for the logged-in user, keeps it cached, and lets you find, deploy, and delete the
+services that run on it. It builds on the authenticated fetch, so all instance and service requests are
+authorized automatically.
+
+### Creating and initializing
+
+Pass the **Aggregator Server base URL** (where the Server Description is served) and an authenticated
+`Auth` instance. `init()` resolves the instance to use:
+
+1. a previously cached instance for this server and user, otherwise
+2. the first instance returned by the server's management endpoint, otherwise
+3. a newly created instance.
+
+```ts
+import { Aggregator, getDefaultAuth } from "trustflows-client";
+
+const auth = getDefaultAuth();
+await auth.handleIncomingRedirect();
+
+const aggregator = new Aggregator({
+  serverUrl: "https://aggregator.example/",
+  auth,
+});
+
+await aggregator.init();
+console.log(aggregator.instanceUrl); // the resolved Aggregator Instance URL
+```
+
+Constructor options:
+
+- `serverUrl` (required): the Aggregator Server base URL.
+- `auth` (required): an authenticated `Auth` instance (the user must be logged in).
+- `creationFlow`: which management flow to use when an instance has to be created — `"none"`,
+  `"provision"`, `"authorization_code"`, or `"device_code"`. Defaults to the first flow advertised by
+  the server.
+- `authorizationServer`: the UMA Authorization Server governing the Aggregator's resources. Required for
+  the interactive creation flows (can also be passed to `startCreation`).
+- `cache`: whether to persist the discovered instance and services. Defaults to `true`.
+- `storage`: the storage used for the cache and pending interactive-flow state. Defaults to
+  `localStorage`.
+
+Use `delete()` to remove the instance (and clear it from the cache):
+
+```ts
+await aggregator.delete();
+```
+
+### Creation flows
+
+`none` and `provision` complete automatically inside `init()`. The interactive flows
+(`authorization_code` and `device_code`) need user interaction, so `init()` throws an
+`AggregatorAuthorizationRequiredError` and you drive the flow with the generic `startCreation()` /
+`finishCreation()` pair. `startCreation()` returns a discriminated step describing what to do next.
+
+```ts
+import { Aggregator, AggregatorAuthorizationRequiredError } from "trustflows-client";
+
+const aggregator = new Aggregator({
+  serverUrl: "https://aggregator.example/",
+  auth,
+  creationFlow: "authorization_code",
+  authorizationServer: "https://as.example",
+});
+
+try {
+  await aggregator.init();
+} catch (error) {
+  if (error instanceof AggregatorAuthorizationRequiredError) {
+    const step = await aggregator.startCreation({
+      redirectUri: "https://app.example/callback",
+    });
+
+    if (step.type === "redirect") {
+      // authorization_code: send the user to the IdP.
+      window.location.href = step.authorizationUrl;
+    } else if (step.type === "device") {
+      // device_code: show the verification details to the user.
+      console.log(step.user_code, step.verification_uri);
+    }
+  }
+}
+```
+
+After the user returns (authorization_code) or while the device flow is pending (device_code), call
+`finishCreation()` to complete it. For `device_code` this polls until the user authorizes; for
+`authorization_code` the `code` and `state` are read from the current URL when omitted.
+
+```ts
+// authorization_code, after the redirect back to your app:
+await aggregator.finishCreation();
+
+// device_code:
+await aggregator.finishCreation(); // resolves once the user has authorized
+```
+
+The same `startCreation()` / `finishCreation()` pair also performs a **token update** when the instance
+already exists but its tokens are no longer valid (`init()` throws an
+`AggregatorAuthorizationRequiredError` with `reason: "token-update"` in that case).
+
+### Managing services
+
+`getService()` returns information about a service that performs a given transformation, creating it if
+it does not exist yet. It resolves in order: the cache, a scan of the Service Collection (matching the
+transformation, optional implementation, and parameter bindings), then deployment.
+
+```ts
+const service = await aggregator.getService({
+  transformation: "https://aggregator.example/transformations#QueryView",
+  // Optional implementation:
+  // implementation: "https://aggregator.example/transformations#QueryViewImpl",
+  parameters: {
+    // A string is treated as a literal term:
+    "https://aggregator.example/transformations#Query": "SELECT * WHERE { ?s ?p ?o }",
+    // Use an object with `type: "iri"` for an IRI term:
+    "https://aggregator.example/transformations#Source": {
+      value: "http://example.org/source1",
+      type: "iri",
+    },
+  },
+});
+
+console.log(service.service);       // the Service Description Endpoint URL
+console.log(service.outputs);       // { "<fno:Output IRI>": ["<dcat:accessURL>", ...] }
+console.log(service.provenanceLog); // the provenance log URL, if the service exposes one
+```
+
+`outputs` maps each `fno:Output` IRI to the list of its distribution access URLs. When an output has
+multiple distributions (for example different formats), all of their access URLs are returned and you
+can fetch the Service Description yourself to decide which one to use.
+
+List every service currently deployed, or delete one by its Service Description URL:
+
+```ts
+const services = await aggregator.getServiceCollection();
+
+await aggregator.deleteService(service.service);
+```
+
+All service methods require `init()` to have completed; calling them earlier throws an
+`AggregatorNotInitializedError`.
+
+

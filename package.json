@@ -30,8 +30,13 @@
     "test:browser:webkit": "vitest run --browser --browser.name=webkit",
     "test:watch": "vitest"
   },
-  "dependencies": {},
+  "dependencies": {
+    "jsonld": "^9.0.0",
+    "n3": "^1.26.0"
+  },
   "devDependencies": {
+    "@types/jsonld": "^1.5.15",
+    "@types/n3": "^1.26.1",
     "@vitest/browser": "^2.0.5",
     "eslint": "^9.0.0",
     "opinionated-eslint-config": "^0.2.0",

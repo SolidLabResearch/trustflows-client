@@ -120,7 +120,12 @@ export function createMockFetch(steps: MockFetchStep[]): typeof fetch {
       responseBody = JSON.stringify(responseBody);
     }
 
-    return new Response(responseBody ?? '', {
+    const nullBodyStatus =
+      step.response.status === 204 ||
+      step.response.status === 205 ||
+      step.response.status === 304;
+
+    return new Response(nullBodyStatus ? null : responseBody ?? '', {
       status: step.response.status,
       headers: responseHeaders,
     });
