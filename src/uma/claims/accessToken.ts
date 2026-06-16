@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-import { fetchAccessToken } from '../utils';
+import { discoverUmaConfiguration, fetchAccessToken } from '../utils';
 import type { Auth } from '../../auth';
 import type { Claim, PermissionDescription } from '../types';
 import type {
@@ -91,8 +91,13 @@ export async function resolveAccessTokenClaims(
     },
   );
 
-  // TODO fetch the actual config to discover the token endpoint
-  const endpoint = `${issuer.replace(/\/$/u, '')}/token`;
+  const metadata = await discoverUmaConfiguration(issuer, auth.getFetch());
+  const endpoint = metadata.token_endpoint;
+  if (!endpoint) {
+    throw new Error(
+      `UMA configuration for issuer "${issuer}" is missing a token_endpoint.`,
+    );
+  }
   const tokenResult = await fetchAccessToken(auth, endpoint, permissions);
   return {
     claim_token: tokenResult.access_token,

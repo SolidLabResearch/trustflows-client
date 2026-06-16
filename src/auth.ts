@@ -18,6 +18,23 @@ export interface AuthOptions {
   persistTokens?: boolean;
 }
 
+/**
+ * Per-request options for the fetch function returned by
+ * {@link Auth.createAuthFetch}.
+ */
+export interface AuthFetchOptions {
+  /**
+   * When `true`, and the UMA authorization server denies access with a 4xx
+   * error (i.e. the requesting party does not currently have access), an access
+   * request is sent to the authorization server's `/requests` endpoint so the
+   * requesting party can ask for access. The access request's response is then
+   * returned from the fetch call.
+   *
+   * Defaults to `false`, in which case a denial rejects the returned promise.
+   */
+  accessRequest?: boolean;
+}
+
 interface OidcConfiguration {
   authorization_endpoint?: string;
   token_endpoint?: string;
@@ -352,14 +369,41 @@ export class Auth {
     return this.oidcToken;
   }
 
+  /**
+   * Creates a `fetch`-compatible function that transparently handles
+   * authentication. It first tries the request unauthenticated and, only on a
+   * `401`, inspects the `WWW-Authenticate` header: a `UMA` challenge is
+   * satisfied through the UMA flow, otherwise the request is retried with the
+   * OIDC bearer token.
+   *
+   * The returned function accepts an optional third {@link AuthFetchOptions}
+   * argument so behaviour can be tuned **per request**:
+   *
+   * ```ts
+   * const authFetch = auth.createAuthFetch();
+   *
+   * // Standard authenticated request.
+   * await authFetch('https://pod.example/private.txt');
+   *
+   * // Same request, but ask for access if it is denied.
+   * await authFetch('https://pod.example/private.txt', undefined, {
+   *   accessRequest: true,
+   * });
+   * ```
+   *
+   * @returns A `fetch`-like function `(input, init?, options?) => Promise<Response>`.
+   */
   public createAuthFetch(): (
     input: RequestInfo | URL,
     init?: RequestInit,
+    options?: AuthFetchOptions,
   ) => Promise<Response> {
     return async(
       input: RequestInfo | URL,
       init: RequestInit = {},
+      options: AuthFetchOptions = {},
     ): Promise<Response> => {
+      const { accessRequest = false } = options;
       const noTokenResponse = await this.fetchFn(input, init);
       if (noTokenResponse.ok) {
         return noTokenResponse;
@@ -389,6 +433,7 @@ export class Auth {
           {
             auth: this,
             challenge,
+            accessRequest,
           },
         );
       }

@@ -121,6 +121,7 @@ describe('fetchAccessToken', (): void => {
 
     const resourceServer = 'https://rs.example/token';
     const issuer = 'https://as.example';
+    const issuerConfigUrl = `${issuer}/.well-known/uma2-configuration`;
     const issuerTokenEndpoint = `${issuer}/token`;
 
     const requiredClaims = [
@@ -146,6 +147,14 @@ describe('fetchAccessToken', (): void => {
           (JSON.parse(init.body as string) as Record<string, unknown>) :
           {};
       calls.push({ url, body });
+
+      // The issuer's UMA configuration advertises its token endpoint.
+      if (url === issuerConfigUrl) {
+        return new Response(
+          JSON.stringify({ token_endpoint: issuerTokenEndpoint, issuer }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
 
       // The shared issuer grants a single access token covering all
       // requested permissions in one round trip.

@@ -232,6 +232,14 @@ export async function fetchAccessToken(
 export interface UmaFetchOptions {
   auth: Auth;
   challenge: AuthorizationChallenge;
+
+  /**
+   * When `true`, and the authorization server's token endpoint denies access
+   * with a 4xx error, an access request is sent to the authorization server's
+   * `/requests` endpoint so the requesting party can ask for access. Defaults
+   * to `false`. When an access request is sent, its response is returned.
+   */
+  accessRequest?: boolean;
 }
 
 export async function fetchWithUma(
@@ -255,11 +263,32 @@ export async function fetchWithUma(
     throw new Error('UMA metadata is missing a token_endpoint.');
   }
 
-  const tokenResult = await fetchAccessToken(
-    auth,
-    tokenEndpoint,
-    challenge.ticket,
-  );
+  let tokenResult: SuccessfulTokenResponse;
+  try {
+    tokenResult = await fetchAccessToken(auth, tokenEndpoint, challenge.ticket);
+  } catch (error: unknown) {
+    if (
+      options.accessRequest &&
+      error instanceof TokenRequestError &&
+      error.status >= 400 &&
+      error.status < 500
+    ) {
+      const requestingParty = auth.webId;
+      if (!requestingParty) {
+        throw new Error(
+          'Cannot send an access request without a requesting party WebID.',
+        );
+      }
+      return requestAccess({
+        asUri: challenge.as_uri,
+        resourceUrl: resolveRequestUrl(input),
+        requestingParty,
+        method: resolveRequestMethod(input, init),
+        fetchFn,
+      });
+    }
+    throw error;
+  }
 
   const headers = mergeHeaders(init?.headers, {
     Authorization: `${tokenResult.token_type} ${tokenResult.access_token}`,
@@ -269,6 +298,138 @@ export async function fetchWithUma(
     ...init,
     headers,
   });
+}
+
+/**
+ * Maps an HTTP method to the ODRL action used in an access request.
+ */
+export function methodToRequestedAction(method: string): string {
+  switch (method.toUpperCase()) {
+    case 'DELETE':
+      return 'odrl:delete';
+    case 'PATCH':
+    case 'POST':
+    case 'PUT':
+      return 'odrl:write';
+    default:
+      return 'odrl:read';
+  }
+}
+
+/**
+ * Percent-escapes a requesting party WebID for use in the `Authorization`
+ * header of an access request (`:`, `/`, `#`, ... become `%` codes).
+ */
+export function escapeWebId(webId: string): string {
+  return encodeURIComponent(webId);
+}
+
+/**
+ * Builds the access request endpoint from the authorization server URI, e.g.
+ * `http://as.local:4000/uma` becomes `http://as.local:4000/uma/requests`.
+ */
+export function buildAccessRequestEndpoint(asUri: string): string {
+  return joinUrl(asUri, 'requests');
+}
+
+export interface AccessRequestOptions {
+  /**
+   * The authorization server URI (`as_uri` from the UMA challenge).
+   */
+  asUri: string;
+
+  /**
+   * The resource the requesting party wants access to.
+   */
+  resourceUrl: string;
+
+  /**
+   * The WebID of the requesting party.
+   */
+  requestingParty: string;
+
+  /**
+   * The HTTP method that determines the requested ODRL action. Defaults to
+   * `GET` (i.e. `odrl:read`).
+   */
+  method?: string;
+
+  /**
+   * The fetch implementation to use.
+   */
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Builds the Turtle body of an access request (a `sotw:EvaluationRequest`).
+ */
+export function buildAccessRequestBody(
+  options: Pick<AccessRequestOptions, 'resourceUrl' | 'requestingParty' | 'method'>,
+): string {
+  const action = methodToRequestedAction(options.method ?? 'GET');
+  const requestId = `http://example.org/access-request/${randomRequestId()}`;
+  return `@prefix sotw: <https://w3id.org/force/sotw#> .
+@prefix odrl: <http://www.w3.org/ns/odrl/2/> .
+@prefix ex: <http://example.org/> .
+
+<${requestId}> a sotw:EvaluationRequest ;
+  sotw:requestedTarget <${options.resourceUrl}> ;
+  sotw:requestedAction ${action} ;
+  sotw:requestingParty <${options.requestingParty}> ;
+  ex:requestStatus ex:requested .
+`;
+}
+
+/**
+ * Sends an access request to the authorization server so the requesting party
+ * can ask for access to a resource they currently cannot access.
+ */
+export async function requestAccess(
+  options: AccessRequestOptions,
+): Promise<Response> {
+  const fetchFn = options.fetchFn ?? fetch;
+  const endpoint = buildAccessRequestEndpoint(options.asUri);
+  const body = buildAccessRequestBody(options);
+
+  return fetchFn(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `WebID ${escapeWebId(options.requestingParty)}`,
+      'content-type': 'text/turtle',
+    },
+    body,
+  });
+}
+
+function resolveRequestUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  return input.url;
+}
+
+function resolveRequestMethod(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): string {
+  if (init?.method) {
+    return init.method;
+  }
+  if (input instanceof Request) {
+    return input.method;
+  }
+  return 'GET';
+}
+
+function randomRequestId(): string {
+  const cryptoObj = globalThis.crypto as Crypto | undefined;
+  if (cryptoObj?.randomUUID) {
+    return cryptoObj.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function stableStringify(value: unknown): string {
