@@ -28,7 +28,9 @@
     "test:browser:chromium": "vitest run --browser --browser.name=chromium",
     "test:browser:firefox": "vitest run --browser --browser.name=firefox",
     "test:browser:webkit": "vitest run --browser --browser.name=webkit",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "release": "bash scripts/release.sh",
+    "release:notest": "bash scripts/release.sh --no-checks"
   },
   "dependencies": {
     "jsonld": "^9.0.0",
