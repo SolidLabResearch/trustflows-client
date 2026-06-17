@@ -9,6 +9,7 @@ import {
   fetchWithUma,
   parseUmaAuthenticateHeader,
 } from './uma/utils';
+import { discoverOidcIssuer } from './utils';
 
 export interface AuthOptions {
   fetch?: typeof fetch;
@@ -48,6 +49,27 @@ interface UmaTokenCacheEntry {
   expires_at?: number;
 }
 
+interface TokenResponse {
+  access_token?: string;
+  id_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  token_type?: string;
+}
+
+interface ClientCredentials {
+  id: string;
+  secret: string;
+  scope: string;
+}
+
+interface AccountControls {
+  controls?: {
+    password?: { login?: string };
+    account?: { clientCredentials?: string };
+  };
+}
+
 export class Auth {
   public oidcAccessToken?: string;
   public oidcToken?: string;
@@ -62,6 +84,7 @@ export class Auth {
   private readonly claimResolvers: ClaimResolverRegistry;
   private readonly persistTokens: boolean;
   private oidcIssuer?: string;
+  private clientCredentials?: ClientCredentials;
   private handleRedirectPromise?: Promise<boolean>;
 
   public constructor(options: AuthOptions = {}) {
@@ -80,6 +103,7 @@ export class Auth {
     ];
     this.hydrateOidcTokens();
     this.hydrateUmaTokens();
+    this.hydrateClientCredentials();
   }
 
   public addClaimResolver(
@@ -240,23 +264,8 @@ export class Auth {
         throw new Error(`Token endpoint error ${tokenResp.status}`);
       }
 
-      const tokenJson = (await tokenResp.json()) as {
-        access_token?: string;
-        id_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-      };
-
-      this.oidcAccessToken = tokenJson.access_token;
-      this.oidcToken = tokenJson.id_token;
-      this.oidcRefreshToken = tokenJson.refresh_token;
-      if (tokenJson.expires_in) {
-        this.oidcTokenExpiry = Date.now() + tokenJson.expires_in * 1000;
-      }
-      if (tokenJson.id_token) {
-        this.webId = this.extractWebId(tokenJson.id_token);
-      }
-      this.persistOidcTokens();
+      const tokenJson = (await tokenResp.json()) as TokenResponse;
+      this.applyTokenResponse(tokenJson);
 
       window.history.replaceState({}, document.title, redirectUri);
       return true;
@@ -298,40 +307,38 @@ export class Auth {
     if (!resp.ok) {
       throw new Error(`Refresh token endpoint error ${resp.status}`);
     }
-    const json = (await resp.json()) as {
-      access_token?: string;
-      id_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-    if (json.access_token) {
-      this.oidcAccessToken = json.access_token;
-    }
-    if (json.id_token) {
-      this.oidcToken = json.id_token;
-      this.webId = this.extractWebId(json.id_token);
-    }
-    if (json.refresh_token) {
-      this.oidcRefreshToken = json.refresh_token;
-    }
-    if (json.expires_in) {
-      this.oidcTokenExpiry = Date.now() + json.expires_in * 1000;
-    }
-    this.persistOidcTokens();
+    const json = (await resp.json()) as TokenResponse;
+    this.applyTokenResponse(json);
   }
 
   public async ensureValidToken(): Promise<void> {
-    if (!this.oidcTokenExpiry || !this.oidcRefreshToken) {
+    if (!this.oidcTokenExpiry) {
       return;
     }
     if (Date.now() < this.oidcTokenExpiry - 60_000) {
       return;
     }
 
-    const storage = this.getStorage();
-    const issuer = storage.getItem('oidc_issuer');
-    const clientId = storage.getItem('oidc_client_id');
-    if (!issuer || !clientId) {
+    const issuer = this.oidcIssuer ?? this.storage?.getItem('oidc_issuer') ?? undefined;
+    if (!issuer) {
+      return;
+    }
+
+    if (this.clientCredentials) {
+      const config = await this.getOidcConfig(issuer);
+      if (!config.token_endpoint) {
+        return;
+      }
+      await this.requestClientCredentialsToken(config.token_endpoint);
+      return;
+    }
+
+    if (!this.oidcRefreshToken) {
+      return;
+    }
+
+    const clientId = this.storage?.getItem('oidc_client_id');
+    if (!clientId) {
       return;
     }
 
@@ -340,6 +347,193 @@ export class Auth {
       return;
     }
     await this.refreshTokens(config.token_endpoint, clientId);
+  }
+
+  /**
+   * Logs in with client credentials using only a WebID and the account's
+   * email/password. The Solid-OIDC issuer is discovered from the WebID profile,
+   * a fresh client credentials token is minted on that server (via the Community
+   * Solid Server account API) and immediately exchanged for an access token,
+   * which then auto-renews through {@link ensureValidToken}.
+   *
+   * ⚠️ **Security warning:** this sends the account's email/password and stores
+   * a long-lived secret on the client. Use it for testing and demos only —
+   * prefer the interactive {@link login} flow in production.
+   */
+  public async loginClientCredentials(
+    webId: string,
+    email: string,
+    password: string,
+  ): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.warn(
+      'Auth.loginClientCredentials uses an email/password and stores a ' +
+      'long-lived secret on the client. This is insecure and meant for ' +
+      'testing and demos only.',
+    );
+    const issuer = await discoverOidcIssuer(this.fetchFn, webId);
+    const { id, secret } = await this.createClientCredentials(
+      issuer,
+      email,
+      password,
+      { name: `trustflows-client-${Date.now()}`, webId },
+    );
+    await this.loginWithClientCredentials(issuer, id, secret);
+  }
+
+  /**
+   * Mints a long-lived client credentials token through the Community Solid
+   * Server account API. Logs in with the account's email/password to obtain an
+   * account token, then asks the server to generate credentials for the given
+   * WebID. The secret cannot be retrieved again, so it is used immediately by
+   * {@link loginClientCredentials}.
+   */
+  private async createClientCredentials(
+    server: string,
+    email: string,
+    password: string,
+    options: { name?: string; webId?: string } = {},
+  ): Promise<{ id: string; secret: string; resource: string }> {
+    const accountUrl = `${server.replace(/\/$/u, '')}/.account/`;
+
+    const indexResponse = await this.fetchFn(accountUrl);
+    if (!indexResponse.ok) {
+      throw await this.describeHttpError('Account API error', indexResponse);
+    }
+    const loginUrl = ((await indexResponse.json()) as AccountControls)
+      .controls?.password?.login;
+    if (!loginUrl) {
+      throw new Error('Account API does not expose a password login control.');
+    }
+
+    const loginResponse = await this.fetchFn(loginUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!loginResponse.ok) {
+      throw await this.describeHttpError('Account login error', loginResponse);
+    }
+    const { authorization } = (await loginResponse.json()) as {
+      authorization?: string;
+    };
+    if (!authorization) {
+      throw new Error('Account login did not return an authorization value.');
+    }
+
+    const authHeader = { authorization: `CSS-Account-Token ${authorization}` };
+    const authedIndexResponse = await this.fetchFn(accountUrl, {
+      headers: authHeader,
+    });
+    if (!authedIndexResponse.ok) {
+      throw await this.describeHttpError('Account API error', authedIndexResponse);
+    }
+    const credentialsUrl = ((await authedIndexResponse.json()) as AccountControls)
+      .controls?.account?.clientCredentials;
+    if (!credentialsUrl) {
+      throw new Error('Account API does not expose a client credentials control.');
+    }
+
+    const credentialsResponse = await this.fetchFn(credentialsUrl, {
+      method: 'POST',
+      headers: { ...authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: options.name ?? `trustflows-${Date.now()}`,
+        webId: options.webId,
+      }),
+    });
+    if (!credentialsResponse.ok) {
+      throw await this.describeHttpError('Client credentials error', credentialsResponse);
+    }
+    return (await credentialsResponse.json()) as {
+      id: string;
+      secret: string;
+      resource: string;
+    };
+  }
+
+  private async describeHttpError(prefix: string, response: Response): Promise<Error> {
+    let detail = '';
+    try {
+      detail = (await response.text()).trim();
+    } catch {
+      /* Ignore */
+    }
+    return new Error(
+      detail ?
+        `${prefix} ${response.status}: ${detail}` :
+        `${prefix} ${response.status}`,
+    );
+  }
+
+  /**
+   * Requests an access token from the issuer's token endpoint using a client
+   * credentials `id`/`secret` pair. The pair is retained so
+   * {@link ensureValidToken} can transparently request a fresh access token
+   * when the current one expires (there is no refresh token).
+   */
+  private async loginWithClientCredentials(
+    issuer: string,
+    id: string,
+    secret: string,
+  ): Promise<void> {
+    const config = await this.getOidcConfig(issuer);
+    if (!config.token_endpoint) {
+      throw new Error('Missing token_endpoint in OIDC configuration');
+    }
+
+    this.oidcIssuer = issuer;
+    this.clientCredentials = { id, secret, scope: 'webid' };
+    this.storage?.setItem('oidc_issuer', issuer);
+
+    await this.requestClientCredentialsToken(config.token_endpoint);
+    this.persistClientCredentials();
+  }
+
+  private async requestClientCredentialsToken(tokenEndpoint: string): Promise<void> {
+    if (!this.clientCredentials) {
+      throw new Error('No client credentials available.');
+    }
+    const { id, secret, scope } = this.clientCredentials;
+    const authString = `${encodeURIComponent(id)}:${encodeURIComponent(secret)}`;
+    const resp = await this.fetchFn(tokenEndpoint, {
+      method: 'POST',
+      headers: {
+        authorization: `Basic ${btoa(authString)}`,
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        scope,
+      }).toString(),
+    });
+    if (!resp.ok) {
+      throw new Error(`Token endpoint error ${resp.status}`);
+    }
+    const json = (await resp.json()) as TokenResponse;
+    this.applyTokenResponse(json);
+  }
+
+  private applyTokenResponse(json: TokenResponse): void {
+    if (json.access_token !== undefined) {
+      this.oidcAccessToken = json.access_token;
+    }
+    if (json.id_token !== undefined) {
+      this.oidcToken = json.id_token;
+      this.webId = this.extractWebId(json.id_token);
+    } else if (json.access_token !== undefined) {
+      const webId = this.extractWebId(json.access_token);
+      if (webId) {
+        this.webId = webId;
+      }
+    }
+    if (json.refresh_token !== undefined) {
+      this.oidcRefreshToken = json.refresh_token;
+    }
+    if (json.expires_in !== undefined) {
+      this.oidcTokenExpiry = Date.now() + json.expires_in * 1000;
+    }
+    this.persistOidcTokens();
   }
 
   public async getOidcConfig(issuer: string): Promise<OidcConfiguration> {
@@ -473,6 +667,7 @@ export class Auth {
       this.oidcTokenExpiry = undefined;
       this.webId = undefined;
       this.oidcIssuer = undefined;
+      this.clientCredentials = undefined;
     } catch {
       /* Ignore */
     }
@@ -484,6 +679,7 @@ export class Auth {
       storage?.removeItem('oidc_client_id');
       storage?.removeItem('oidc_redirect_uri');
       storage?.removeItem('oidc_tokens');
+      storage?.removeItem('client_credentials');
     } catch {
       /* Ignore */
     }
@@ -553,6 +749,46 @@ export class Auth {
         web_id: this.webId,
       };
       this.storage.setItem('oidc_tokens', JSON.stringify(payload));
+    } catch {
+      /* Ignore */
+    }
+  }
+
+  private hydrateClientCredentials(): void {
+    if (!this.persistTokens || !this.storage) {
+      return;
+    }
+    try {
+      const raw = this.storage.getItem('client_credentials');
+      if (!raw) {
+        return;
+      }
+      const data = JSON.parse(raw) as Partial<ClientCredentials>;
+      if (data.id && data.secret) {
+        this.clientCredentials = {
+          id: data.id,
+          secret: data.secret,
+          scope: data.scope ?? 'webid',
+        };
+      }
+    } catch {
+      /* Ignore */
+    }
+  }
+
+  private persistClientCredentials(): void {
+    if (!this.persistTokens || !this.storage) {
+      return;
+    }
+    try {
+      if (this.clientCredentials) {
+        this.storage.setItem(
+          'client_credentials',
+          JSON.stringify(this.clientCredentials),
+        );
+      } else {
+        this.storage.removeItem('client_credentials');
+      }
     } catch {
       /* Ignore */
     }

@@ -79,6 +79,33 @@ const authFetch = auth.createAuthFetch();
 const loggedIn = await auth.isLoggedIn();
 ```
 
+### Client credentials login (testing only)
+
+For tests and demos where the interactive redirect flow is impractical, `auth.loginClientCredentials()`
+logs in with just a WebID and the account's email/password. It discovers the Solid-OIDC issuer from the
+WebID profile (`solid:oidcIssuer`), mints a [Community Solid Server](https://github.com/CommunitySolidServer/CommunitySolidServer)
+client credentials token via the account API, and exchanges it for an access token. There is no redirect
+and no refresh token; the access token is renewed automatically (the `id`/`secret` are kept for that).
+
+```ts
+import { getDefaultAuth } from "trustflows-client";
+
+const auth = getDefaultAuth();
+
+await auth.loginClientCredentials(
+  "http://localhost:3000/alice/profile/card#me", // WebID
+  "alice@example.org",                            // account email
+  "abc123",                                       // account password
+);
+
+const authFetch = auth.createAuthFetch();
+```
+
+> ⚠️ **Security warning:** this sends the account's email/password and stores a long-lived client
+> credentials secret on the client (in `storage` as `client_credentials`, unless `persistTokens: false`).
+> Never use it in production or in code exposed to untrusted users — use the interactive `login()` flow
+> there.
+
 ## Authenticated fetch
 
 `auth.createAuthFetch()` returns a `fetch`-compatible function. It first tries the request
