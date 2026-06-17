@@ -114,6 +114,25 @@ describe('Auth.loginClientCredentials', (): void => {
       JSON.stringify({ id, secret, scope: 'webid' }),
     );
   });
+  it('discovers the issuer from a JSON-LD WebID profile', async(): Promise<void> => {
+    const storage = new MemoryStorage();
+    const jsonLdProfileStep: MockFetchStep = {
+      request: { url: 'http://localhost:3000/demo/profile/card', method: 'GET' },
+      response: {
+        status: 200,
+        headers: { 'content-type': 'application/ld+json' },
+        body: JSON.stringify({
+          '@id': webId,
+          'http://www.w3.org/ns/solid/terms#oidcIssuer': { '@id': 'http://localhost:3000/' },
+        }),
+      },
+    };
+    const fetchMock = createMockFetch([ jsonLdProfileStep, ...accountSteps, configStep, tokenStep ]);
+    const auth = new Auth({ fetch: fetchMock, storage });
+    await auth.loginClientCredentials(webId, email, password);
+    expect(auth.oidcAccessToken).toBe(oidcToken.access_token);
+    expect(storage.getItem('oidc_issuer')).toBe(issuer);
+  });
   it('re-requests a fresh access token when the current one expires', async(): Promise<void> => {
     const storage = new MemoryStorage();
     const fetchMock = createMockFetch([
