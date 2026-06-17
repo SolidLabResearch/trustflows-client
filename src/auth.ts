@@ -511,7 +511,15 @@ export class Auth {
       throw new Error(`Token endpoint error ${resp.status}`);
     }
     const json = (await resp.json()) as TokenResponse;
-    this.applyTokenResponse(json);
+
+    const token = json.id_token ?? json.access_token;
+    this.applyTokenResponse({
+      access_token: json.access_token ?? token,
+      id_token: token,
+      refresh_token: json.refresh_token,
+      expires_in: json.expires_in,
+      token_type: json.token_type,
+    });
   }
 
   private applyTokenResponse(json: TokenResponse): void {

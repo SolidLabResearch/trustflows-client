@@ -107,6 +107,7 @@ describe('Auth.loginClientCredentials', (): void => {
     const fetchMock = createMockFetch([ profileStep, ...accountSteps, configStep, tokenStep ]);
     const auth = new Auth({ fetch: fetchMock, storage });
     await auth.loginClientCredentials(webId, email, password);
+    expect(auth.oidcToken).toBe(oidcToken.access_token);
     expect(auth.oidcAccessToken).toBe(oidcToken.access_token);
     expect(auth.webId).toBe(webId);
     expect(storage.getItem('oidc_issuer')).toBe(issuer);
@@ -130,10 +131,11 @@ describe('Auth.loginClientCredentials', (): void => {
     const fetchMock = createMockFetch([ jsonLdProfileStep, ...accountSteps, configStep, tokenStep ]);
     const auth = new Auth({ fetch: fetchMock, storage });
     await auth.loginClientCredentials(webId, email, password);
+    expect(auth.oidcToken).toBe(oidcToken.access_token);
     expect(auth.oidcAccessToken).toBe(oidcToken.access_token);
     expect(storage.getItem('oidc_issuer')).toBe(issuer);
   });
-  it('re-requests a fresh access token when the current one expires', async(): Promise<void> => {
+  it('re-requests a fresh token when the current one expires', async(): Promise<void> => {
     const storage = new MemoryStorage();
     const fetchMock = createMockFetch([
       profileStep,
@@ -147,6 +149,7 @@ describe('Auth.loginClientCredentials', (): void => {
     await auth.loginClientCredentials(webId, email, password);
     auth.oidcTokenExpiry = Date.now() - 1000;
     await auth.ensureValidToken();
+    expect(auth.oidcToken).toBe(oidcToken.access_token);
     expect(auth.oidcAccessToken).toBe(oidcToken.access_token);
   });
   it('restores client credentials from storage so renewal keeps working', async(): Promise<void> => {
@@ -163,6 +166,7 @@ describe('Auth.loginClientCredentials', (): void => {
     const fetchMock = createMockFetch([ configStep, tokenStep ]);
     const auth = new Auth({ fetch: fetchMock, storage });
     await auth.ensureValidToken();
+    expect(auth.oidcToken).toBe(oidcToken.access_token);
     expect(auth.oidcAccessToken).toBe(oidcToken.access_token);
     expect(auth.webId).toBe(webId);
   });
