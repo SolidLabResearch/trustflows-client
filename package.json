@@ -1,6 +1,6 @@
 {
   "name": "trustflows-client",
-  "version": "0.1.0-alpha.5",
+  "version": "0.1.0-alpha.6",
   "description": "Trustflows client helpers for Solid applications.",
   "type": "module",
   "main": "./dist/index.js",
