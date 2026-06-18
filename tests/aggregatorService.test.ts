@@ -128,13 +128,17 @@ describe('Aggregator services', (): void => {
     expect(info.outputs).toEqual({ [outputIri]: [ outputAccessUrl ]});
   });
 
-  it('serves a cached service without any service requests', async(): Promise<void> => {
+  it('checks a cached service exists before returning it', async(): Promise<void> => {
     const storage = cachedInstanceStorage();
     const fetchMock = createMockFetch([
       ...initSteps,
       {
         request: { url: serviceCollectionEndpoint, method: 'GET' },
         response: turtle(collectionWithServiceTurtle),
+      },
+      {
+        request: { url: serviceUrl, method: 'GET' },
+        response: turtle(serviceDescriptionTurtle),
       },
       {
         request: { url: serviceUrl, method: 'GET' },
@@ -149,10 +153,52 @@ describe('Aggregator services', (): void => {
     });
     await aggregator.init();
     await aggregator.getService(serviceRequest);
-    // Second call must hit the cache (no further fetch steps are defined).
     const info = await aggregator.getService(serviceRequest);
 
     expect(info.service).toBe(serviceUrl);
+  });
+
+  it('clears a cached service that no longer exists and resolves it again', async(): Promise<void> => {
+    const storage = cachedInstanceStorage();
+    new AggregatorCache({ storage, enabled: true }).setService(
+      instanceUrl,
+      serviceRequestKey(serviceRequest),
+      { service: serviceUrl, outputs: {}},
+    );
+    const fetchMock = createMockFetch([
+      ...initSteps,
+      {
+        request: { url: serviceUrl, method: 'GET' },
+        response: { status: 404 },
+      },
+      {
+        request: { url: serviceCollectionEndpoint, method: 'GET' },
+        response: {
+          status: 200,
+          headers: { 'content-type': 'text/turtle', 'accept-post': 'text/turtle' },
+          body: emptyCollectionTurtle,
+        },
+      },
+      {
+        request: { url: serviceCollectionEndpoint, method: 'POST' },
+        response: {
+          status: 201,
+          headers: { 'content-type': 'text/turtle', location: serviceUrl },
+          body: serviceDescriptionTurtle,
+        },
+      },
+    ]);
+
+    const aggregator = new Aggregator({
+      auth: createAuth(fetchMock, storage),
+      serverUrl,
+      storage,
+    });
+    await aggregator.init();
+    const info = await aggregator.getService(serviceRequest);
+
+    expect(info.service).toBe(serviceUrl);
+    expect(info.outputs).toEqual({ [outputIri]: [ outputAccessUrl ]});
   });
 
   it('recreates a destroyed instance and deploys the service', async(): Promise<void> => {

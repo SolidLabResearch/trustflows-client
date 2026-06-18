@@ -159,7 +159,7 @@ export class Aggregator {
     const { webId, serverDescription, flow, format } = await this.ensureServerContext();
     const endpoint = serverDescription.management_endpoint;
     const existing =
-      this.internalInstanceUrl ?? this.cache.getInstance(this.serverUrl, webId)?.aggregator;
+      this.internalInstanceUrl ?? await this.getLiveCachedInstance(webId);
 
     if (flow === 'none' || flow === 'provision') {
       if (existing) {
@@ -293,7 +293,16 @@ export class Aggregator {
 
     const cached = this.cache.getService(this.internalInstanceUrl!, key);
     if (cached) {
-      return cached;
+      try {
+        return toServiceInfo(
+          await loadServiceDescription(this.authFetch, cached.service),
+        );
+      } catch (error: unknown) {
+        if (!isNotFound(error)) {
+          throw error;
+        }
+        this.cache.clearServiceByUrl(cached.service);
+      }
     }
 
     return this.resolveService(request, key, true);
@@ -416,6 +425,25 @@ export class Aggregator {
     this.flow = flow;
 
     return { webId, serverDescription, flow, format };
+  }
+
+  private async getLiveCachedInstance(webId: string): Promise<string | undefined> {
+    const cached = this.cache.getInstance(this.serverUrl, webId);
+    if (!cached) {
+      return undefined;
+    }
+
+    try {
+      await fetchAggregatorDescription(this.authFetch, cached.aggregator);
+    } catch (error: unknown) {
+      if (!isNotFound(error)) {
+        throw error;
+      }
+      this.cache.clearInstance(this.serverUrl, webId);
+      return undefined;
+    }
+
+    return cached.aggregator;
   }
 
   private cacheInstance(

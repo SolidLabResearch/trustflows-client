@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { describe, expect, it } from 'vitest';
 import { Aggregator, Auth } from '../src';
+import { AggregatorCache } from '../src/aggregator/cache';
 import { createMockFetch, type MockFetchStep } from './helpers/mockFetch';
 import { MemoryStorage } from './helpers/storage';
 import { oidcToken, webId } from './fixtures/servers';
@@ -33,6 +34,25 @@ const descriptionStep: MockFetchStep = {
 };
 
 describe('Aggregator interactive creation', (): void => {
+  it('checks a cached instance exists before reusing it in startCreation', async(): Promise<void> => {
+    const storage = new MemoryStorage();
+    new AggregatorCache({ storage, enabled: true }).setInstance(serverUrl, webId, {
+      aggregator: instanceUrl,
+      flow: 'provision',
+    });
+    const fetchMock = createMockFetch([ serverStep, descriptionStep ]);
+
+    const aggregator = new Aggregator({
+      auth: createAuth(fetchMock, storage),
+      serverUrl,
+      storage,
+    });
+
+    const step = await aggregator.startCreation();
+
+    expect(step).toEqual({ type: 'done', aggregator: instanceUrl });
+  });
+
   it('runs the authorization_code flow', async(): Promise<void> => {
     const storage = new MemoryStorage();
     const fetchMock = createMockFetch([
