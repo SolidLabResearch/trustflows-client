@@ -10,7 +10,7 @@ import type {
   TokenRequest,
   Claim as UmaClaimToken,
 } from './types';
-import type { RequiredClaims } from './claims/types';
+import type { ClaimResolutionContext, RequiredClaims } from './claims/types';
 import { resolveClaimResolver } from './claims/registry';
 import {
   ID_TOKEN_CLAIM_FORMAT,
@@ -20,6 +20,7 @@ import {
 export class TokenRequestError extends Error {
   public readonly status: number;
   public readonly payload?: unknown;
+  public accessRequestResponse?: Response;
 
   public constructor(message: string, status: number, payload?: unknown) {
     super(message);
@@ -98,6 +99,7 @@ export async function fetchAccessToken(
   auth: Auth,
   tokenEndpoint: string,
   request: string | PermissionDescription[],
+  context: ClaimResolutionContext = {},
 ): Promise<SuccessfulTokenResponse> {
   const fetchFn = auth.getFetch();
   const pushedClaimKeys = new Set<string>();
@@ -197,20 +199,16 @@ export async function fetchAccessToken(
 
     const { groupBy, resolveGroup } = resolver;
     if (groupBy && resolveGroup) {
-      // The resolver opted in to combining several required claims that it
-      // matches and that share the same group key into a single resolution
-      // (e.g. all access-token permissions for the same issuer). This stays
-      // generic so external resolvers can use it too.
       const groupKey = groupBy(nextRequired);
       const group = pending.filter(
         (claim): boolean =>
           resolveClaimResolver(claim, resolvers) === resolver &&
           groupBy(claim) === groupKey,
       );
-      resolvedClaim = await resolveGroup(group, auth);
+      resolvedClaim = await resolveGroup(group, auth, context);
       handledClaims.push(...group);
     } else {
-      resolvedClaim = await resolver.resolve(nextRequired, auth);
+      resolvedClaim = await resolver.resolve(nextRequired, auth, context);
       handledClaims.push(nextRequired);
     }
 
@@ -265,8 +263,14 @@ export async function fetchWithUma(
 
   let tokenResult: SuccessfulTokenResponse;
   try {
-    tokenResult = await fetchAccessToken(auth, tokenEndpoint, challenge.ticket);
+    tokenResult = await fetchAccessToken(auth, tokenEndpoint, challenge.ticket, {
+      accessRequest: options.accessRequest,
+      requestingParty: auth.webId,
+    });
   } catch (error: unknown) {
+    if (error instanceof TokenRequestError && error.accessRequestResponse) {
+      return error.accessRequestResponse;
+    }
     if (
       options.accessRequest &&
       error instanceof TokenRequestError &&
@@ -355,6 +359,12 @@ export interface AccessRequestOptions {
   method?: string;
 
   /**
+   * Explicit ODRL actions to request. When omitted, the action is inferred
+   * from `method`.
+   */
+  requestedActions?: string[];
+
+  /**
    * The fetch implementation to use.
    */
   fetchFn?: typeof fetch;
@@ -364,9 +374,14 @@ export interface AccessRequestOptions {
  * Builds the Turtle body of an access request (a `sotw:EvaluationRequest`).
  */
 export function buildAccessRequestBody(
-  options: Pick<AccessRequestOptions, 'resourceUrl' | 'requestingParty' | 'method'>,
+  options: Pick<
+    AccessRequestOptions,
+    'resourceUrl' | 'requestingParty' | 'method' | 'requestedActions'
+  >,
 ): string {
-  const action = methodToRequestedAction(options.method ?? 'GET');
+  const actions = options.requestedActions?.length ?
+    options.requestedActions :
+      [ methodToRequestedAction(options.method ?? 'GET') ];
   const requestId = `http://example.org/access-request/${randomRequestId()}`;
   return `@prefix sotw: <https://w3id.org/force/sotw#> .
 @prefix odrl: <http://www.w3.org/ns/odrl/2/> .
@@ -374,7 +389,7 @@ export function buildAccessRequestBody(
 
 <${requestId}> a sotw:EvaluationRequest ;
   sotw:requestedTarget <${options.resourceUrl}> ;
-  sotw:requestedAction ${action} ;
+  sotw:requestedAction ${actions.join(', ')} ;
   sotw:requestingParty <${options.requestingParty}> ;
   ex:requestStatus ex:requested .
 `;
@@ -399,6 +414,63 @@ export async function requestAccess(
     },
     body,
   });
+}
+
+export async function requestDerivedResourceAccess(
+  issuer: string,
+  permissions: PermissionDescription[],
+  auth: Auth,
+  context: ClaimResolutionContext,
+): Promise<Response> {
+  const requestingParty = context.requestingParty ?? auth.webId;
+  if (!requestingParty) {
+    throw new Error(
+      'Cannot send an access request without a requesting party WebID.',
+    );
+  }
+
+  let response: Response | undefined;
+  for (const permission of permissions) {
+    response = await requestAccess({
+      asUri: issuer,
+      resourceUrl: permission.resource_id,
+      requestingParty,
+      requestedActions: scopesToRequestedActions(permission.resource_scopes),
+      fetchFn: auth.getFetch(),
+    });
+  }
+
+  if (!response) {
+    throw new Error('No derived resource permissions were available to request.');
+  }
+  return response;
+}
+
+function scopesToRequestedActions(scopes: string[] | undefined): string[] {
+  if (!scopes || scopes.length === 0) {
+    return [ 'odrl:read' ];
+  }
+
+  return [ ...new Set(scopes.map(scopeToRequestedAction)) ];
+}
+
+function scopeToRequestedAction(scope: string): string {
+  const normalized = scope.trim().toLowerCase();
+  if (normalized.includes('delete')) {
+    return 'odrl:delete';
+  }
+  if (
+    normalized.includes('append') ||
+    normalized.includes('create') ||
+    normalized.includes('update') ||
+    normalized.includes('write')
+  ) {
+    return 'odrl:write';
+  }
+  if (normalized.includes('read') || normalized.includes('view')) {
+    return 'odrl:read';
+  }
+  return scope.includes(':') ? `<${scope}>` : `odrl:${scope}`;
 }
 
 function resolveRequestUrl(input: RequestInfo | URL): string {

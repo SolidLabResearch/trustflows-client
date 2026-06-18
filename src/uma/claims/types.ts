@@ -44,11 +44,27 @@ export interface RequiredClaims extends JsonObject {
 }
 
 /**
+ * Per-request context passed to claim resolvers.
+ */
+export interface ClaimResolutionContext {
+  /**
+   * Whether access requests should be sent for denied derived resources.
+   */
+  accessRequest?: boolean;
+
+  /**
+   * The WebID of the requesting party, required when sending access requests.
+   */
+  requestingParty?: string;
+}
+
+/**
  * Resolves a required claim into a claim token.
  */
 export type ClaimResolver = (
   required: RequiredClaims,
   auth: Auth,
+  context?: ClaimResolutionContext,
 ) => Promise<Claim | undefined> | Claim | undefined;
 
 /**
@@ -59,6 +75,7 @@ export type ClaimResolver = (
 export type ClaimGroupResolver = (
   required: RequiredClaims[],
   auth: Auth,
+  context?: ClaimResolutionContext,
 ) => Promise<Claim | undefined> | Claim | undefined;
 
 export type ClaimField =

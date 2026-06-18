@@ -1,8 +1,14 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-import { discoverUmaConfiguration, fetchAccessToken } from '../utils';
+import {
+  discoverUmaConfiguration,
+  fetchAccessToken,
+  requestDerivedResourceAccess,
+  TokenRequestError,
+} from '../utils';
 import type { Auth } from '../../auth';
-import type { Claim, PermissionDescription } from '../types';
+import type { Claim, PermissionDescription, SuccessfulTokenResponse } from '../types';
 import type {
+  ClaimResolutionContext,
   ClaimResolverDefinition,
   RequiredClaims,
 } from './types';
@@ -65,6 +71,7 @@ export function accessTokenIssuer(required: RequiredClaims): string | undefined 
 export async function resolveAccessTokenClaims(
   requiredClaims: RequiredClaims[],
   auth: Auth,
+  context: ClaimResolutionContext = {},
 ): Promise<Claim> {
   if (requiredClaims.length === 0) {
     throw new Error('No access_token required claims provided to resolve.');
@@ -98,18 +105,193 @@ export async function resolveAccessTokenClaims(
       `UMA configuration for issuer "${issuer}" is missing a token_endpoint.`,
     );
   }
-  const tokenResult = await fetchAccessToken(auth, endpoint, permissions);
+  let tokenResult: SuccessfulTokenResponse;
+  try {
+    tokenResult = await fetchAccessToken(auth, endpoint, permissions, context);
+  } catch (error: unknown) {
+    if (
+      context.accessRequest &&
+      error instanceof TokenRequestError &&
+      error.status >= 400 &&
+      error.status < 500
+    ) {
+      error.accessRequestResponse = await requestDerivedResourceAccess(
+        issuer,
+        permissions,
+        auth,
+        context,
+      );
+    }
+    throw error;
+  }
+  const missingPermissions = missingPermissionsFromJwt(
+    tokenResult.access_token,
+    permissions,
+  );
+  if (context.accessRequest && missingPermissions && missingPermissions.length > 0) {
+    const error = new TokenRequestError(
+      'UMA access token is missing requested permissions.',
+      403,
+      { permissions: missingPermissions },
+    );
+    error.accessRequestResponse = await requestDerivedResourceAccess(
+      issuer,
+      missingPermissions,
+      auth,
+      context,
+    );
+    throw error;
+  }
   return {
     claim_token: tokenResult.access_token,
     claim_token_format: ACCESS_TOKEN_CLAIM_FORMAT,
   };
 }
 
+interface GrantedPermission {
+  resource_id: string;
+  resource_scopes: string[];
+}
+
+function missingPermissionsFromJwt(
+  token: string,
+  requested: PermissionDescription[],
+): PermissionDescription[] | undefined {
+  const payload = decodeJwtPayload(token);
+  if (!payload) {
+    return undefined;
+  }
+
+  const granted = extractGrantedPermissions(payload);
+  if (!granted) {
+    return undefined;
+  }
+
+  return requested.filter(
+    (permission): boolean => !permissionGranted(permission, granted),
+  );
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
+  const parts = token.split('.');
+  if (parts.length < 2) {
+    return undefined;
+  }
+
+  try {
+    const base64 = parts[1].replaceAll('-', '+').replaceAll('_', '/');
+    const padded = base64.padEnd(
+      base64.length + ((4 - base64.length % 4) % 4),
+      '=',
+    );
+    const decoded = globalThis.atob(padded);
+    const payload = JSON.parse(decoded) as unknown;
+    return isRecord(payload) ? payload : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractGrantedPermissions(
+  payload: Record<string, unknown>,
+): GrantedPermission[] | undefined {
+  const candidates = [
+    payload.permissions,
+    isRecord(payload.authorization) ? payload.authorization.permissions : undefined,
+    payload.uma_permissions,
+  ];
+
+  const permissions: GrantedPermission[] = [];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate)) {
+      continue;
+    }
+    for (const entry of candidate) {
+      const permission = parseGrantedPermission(entry);
+      if (permission) {
+        permissions.push(permission);
+      }
+    }
+  }
+
+  return permissions.length > 0 ? permissions : undefined;
+}
+
+function parseGrantedPermission(value: unknown): GrantedPermission | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const resourceId =
+    pickString(value.resource_id) ??
+    pickString(value.derivation_resource_id) ??
+    pickString(value.resource) ??
+    pickString(value.rsid) ??
+    pickString(value.rsname);
+  const scopes = pickStringArray(value.resource_scopes) ??
+    pickStringArray(value.scopes) ??
+    splitScopeString(value.scope);
+
+  if (!resourceId || !scopes || scopes.length === 0) {
+    return undefined;
+  }
+
+  return {
+    resource_id: resourceId,
+    resource_scopes: scopes,
+  };
+}
+
+function permissionGranted(
+  requested: PermissionDescription,
+  granted: GrantedPermission[],
+): boolean {
+  const requestedScopes = requested.resource_scopes ?? [];
+  return granted.some((permission): boolean => {
+    if (permission.resource_id !== requested.resource_id) {
+      return false;
+    }
+    const grantedScopes = new Set(permission.resource_scopes);
+    return requestedScopes.every((scope): boolean => grantedScopes.has(scope));
+  });
+}
+
+function pickString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function pickStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') {
+      return undefined;
+    }
+    strings.push(entry);
+  }
+  return strings;
+}
+
+function splitScopeString(value: unknown): string[] | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const scopes = value.split(/\s+/u).filter(Boolean);
+  return scopes.length > 0 ? scopes : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 export async function accessTokenClaimResolver(
   required: RequiredClaims,
   auth: Auth,
+  context?: ClaimResolutionContext,
 ): Promise<Claim | undefined> {
-  return resolveAccessTokenClaims([ required ], auth);
+  return resolveAccessTokenClaims([ required ], auth, context);
 }
 
 export const accessTokenClaimResolvers: ClaimResolverDefinition[] = [

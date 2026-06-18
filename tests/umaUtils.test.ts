@@ -24,6 +24,14 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
+function jwt(payload: Record<string, unknown>): string {
+  const encoded = btoa(JSON.stringify(payload))
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/u, '');
+  return `header.${encoded}.signature`;
+}
+
 describe('fetchAccessToken', (): void => {
   it('pushes one claim at a time until an access token is returned', async(): Promise<void> => {
     const calls: { body: Record<string, unknown> }[] = [];
@@ -218,6 +226,288 @@ describe('fetchAccessToken', (): void => {
       claim_token: 'combined-access',
       claim_token_format: ACCESS_TOKEN_FORMAT,
     });
+  });
+
+  it('resolves access-token permissions for multiple issuers before retrying', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const ACCESS_TOKEN_FORMAT = 'urn:ietf:params:oauth:token-type:access_token';
+
+    const resourceServer = 'https://rs.example/token';
+    const issuerA = 'https://as-a.example';
+    const issuerB = 'https://as-b.example';
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer: issuerA,
+        derivation_resource_id: 'res-A',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer: issuerB,
+        derivation_resource_id: 'res-B',
+        resource_scopes: [ 'write' ],
+      },
+    ];
+
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body: Record<string, unknown> = init?.body ?
+          (JSON.parse(init.body as string) as Record<string, unknown>) :
+          {};
+      calls.push({ url, body });
+
+      if (url === `${issuerA}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuerA}/token`, issuer: issuerA }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuerB}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuerB}/token`, issuer: issuerB }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuerA}/token`) {
+        return new Response(
+          JSON.stringify({ access_token: 'access-A', token_type: 'Bearer' }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuerB}/token`) {
+        return new Response(
+          JSON.stringify({ access_token: 'access-B', token_type: 'Bearer' }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      const resourceServerCalls = calls.filter(
+        (call): boolean => call.url === resourceServer,
+      );
+      if (resourceServerCalls.length === 1) {
+        return new Response(
+          JSON.stringify({
+            error: 'need_info',
+            required_claims: requiredClaims,
+            ticket: 't2',
+          }),
+          { status: 403, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (resourceServerCalls.length === 2) {
+        return new Response(
+          JSON.stringify({
+            error: 'need_info',
+            required_claims: requiredClaims,
+            ticket: 't3',
+          }),
+          { status: 403, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ access_token: 'access-final', token_type: 'Bearer' }),
+        { status: 200, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+
+    const result = await fetchAccessToken(auth, resourceServer, 't1');
+
+    expect(result).toEqual({ access_token: 'access-final', token_type: 'Bearer' });
+
+    const resourceServerCalls = calls.filter(
+      (call): boolean => call.url === resourceServer,
+    );
+    expect(resourceServerCalls).toHaveLength(3);
+    expect(resourceServerCalls[1].body).toMatchObject({
+      ticket: 't2',
+      claim_token: 'access-A',
+      claim_token_format: ACCESS_TOKEN_FORMAT,
+    });
+    expect(resourceServerCalls[2].body).toMatchObject({
+      ticket: 't3',
+      claim_token: 'access-B',
+      claim_token_format: ACCESS_TOKEN_FORMAT,
+    });
+  });
+
+  it('requests access for all grouped derived resources when their token request is denied', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const resourceServer = 'https://rs.example/token';
+    const issuer = 'https://as.example';
+    const requestingParty = 'https://user.example/#me';
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/a',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/b',
+        resource_scopes: [ 'write' ],
+      },
+    ];
+
+    const calls: { url: string; body: string }[] = [];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body = typeof init?.body === 'string' ? init.body : '';
+      calls.push({ url, body });
+
+      if (url === `${issuer}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuer}/token`, issuer }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/token`) {
+        return new Response(
+          JSON.stringify({ error: 'access_denied' }),
+          { status: 403, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/requests`) {
+        return new Response('', { status: 202 });
+      }
+
+      return new Response(
+        JSON.stringify({
+          error: 'need_info',
+          required_claims: requiredClaims,
+          ticket: 't2',
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+    auth.webId = requestingParty;
+
+    let caught: unknown;
+    try {
+      await fetchAccessToken(auth, resourceServer, 't1', {
+        accessRequest: true,
+        requestingParty,
+      });
+    } catch (error: unknown) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ status: 403 });
+    expect((caught as { accessRequestResponse?: Response }).accessRequestResponse?.status)
+      .toBe(202);
+
+    const requestCalls = calls.filter(
+      (call): boolean => call.url === `${issuer}/requests`,
+    );
+    expect(requestCalls).toHaveLength(2);
+    expect(requestCalls[0].body).toContain(
+      'sotw:requestedTarget <https://data.example/a>',
+    );
+    expect(requestCalls[0].body).toContain('sotw:requestedAction odrl:read');
+    expect(requestCalls[1].body).toContain(
+      'sotw:requestedTarget <https://data.example/b>',
+    );
+    expect(requestCalls[1].body).toContain('sotw:requestedAction odrl:write');
+  });
+
+  it('requests access for permissions missing from a derived JWT access token', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const resourceServer = 'https://rs.example/token';
+    const issuer = 'https://as.example';
+    const requestingParty = 'https://user.example/#me';
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/a',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/b',
+        resource_scopes: [ 'urn:example:css:modes:read' ],
+      },
+    ];
+
+    const calls: { url: string; body: string }[] = [];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body = typeof init?.body === 'string' ? init.body : '';
+      calls.push({ url, body });
+
+      if (url === `${issuer}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuer}/token`, issuer }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/token`) {
+        return new Response(
+          JSON.stringify({
+            access_token: jwt({
+              permissions: [
+                {
+                  resource_id: 'https://data.example/a',
+                  resource_scopes: [ 'read' ],
+                },
+              ],
+            }),
+            token_type: 'Bearer',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/requests`) {
+        return new Response('', { status: 202 });
+      }
+
+      return new Response(
+        JSON.stringify({
+          error: 'need_info',
+          required_claims: requiredClaims,
+          ticket: 't2',
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+    auth.webId = requestingParty;
+
+    await expect(
+      fetchAccessToken(auth, resourceServer, 't1', {
+        accessRequest: true,
+        requestingParty,
+      }),
+    ).rejects.toMatchObject({ status: 403 });
+
+    const requestCalls = calls.filter(
+      (call): boolean => call.url === `${issuer}/requests`,
+    );
+    expect(requestCalls).toHaveLength(1);
+    expect(requestCalls[0].body).toContain(
+      'sotw:requestedTarget <https://data.example/b>',
+    );
+    expect(requestCalls[0].body).toContain('sotw:requestedAction odrl:read');
   });
 
   // Extensibility: an external (custom) resolver that matches several distinct
