@@ -117,6 +117,29 @@ describe('fetchAccessToken', (): void => {
     ).rejects.toThrow(/already pushed/u);
   });
 
+  it('treats empty claim token formats as unauthorized', async(): Promise<void> => {
+    const ticket = 'a84c42a6-adac-4cb8-902c-affcadd41aa2';
+    async function fetchMock(): Promise<Response> {
+      return new Response(
+        JSON.stringify({
+          error: 'need_info',
+          ticket,
+          required_claims: { claim_token_format: [[]]},
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, []);
+
+    await expect(
+      fetchAccessToken(auth, 'https://as.example/token', 't1'),
+    ).rejects.toMatchObject({
+      status: 401,
+      payload: { ticket },
+    });
+  });
+
   // Replication test for the bug where an auth server requests multiple
   // access-token claims that only differ by the targeted resource
   // (derivation_resource_id / resource_scopes) but share the same
@@ -376,7 +399,7 @@ describe('fetchAccessToken', (): void => {
 
       if (url === `${issuer}/token`) {
         return new Response(
-          JSON.stringify({ error: 'access_denied' }),
+          JSON.stringify({ error: 'access_denied', ticket: 'request-ticket' }),
           { status: 403, headers: { 'content-type': 'application/json' }},
         );
       }
@@ -397,6 +420,7 @@ describe('fetchAccessToken', (): void => {
 
     const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
     auth.webId = requestingParty;
+    auth.oidcAccessToken = 'oidc-access-token';
 
     let caught: unknown;
     try {
@@ -414,15 +438,8 @@ describe('fetchAccessToken', (): void => {
     const requestCalls = calls.filter(
       (call): boolean => call.url === `${issuer}/requests`,
     );
-    expect(requestCalls).toHaveLength(2);
-    expect(requestCalls[0].body).toContain(
-      'sotw:requestedTarget <https://data.example/a>',
-    );
-    expect(requestCalls[0].body).toContain('sotw:requestedAction odrl:read');
-    expect(requestCalls[1].body).toContain(
-      'sotw:requestedTarget <https://data.example/b>',
-    );
-    expect(requestCalls[1].body).toContain('sotw:requestedAction odrl:write');
+    expect(requestCalls).toHaveLength(1);
+    expect(JSON.parse(requestCalls[0].body)).toEqual({ ticket: 'request-ticket' });
   });
 
   it('requests access for permissions missing from a derived JWT access token', async(): Promise<void> => {
@@ -471,6 +488,7 @@ describe('fetchAccessToken', (): void => {
               ],
             }),
             token_type: 'Bearer',
+            ticket: 'missing-permissions-ticket',
           }),
           { status: 200, headers: { 'content-type': 'application/json' }},
         );
@@ -492,6 +510,7 @@ describe('fetchAccessToken', (): void => {
 
     const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
     auth.webId = requestingParty;
+    auth.oidcAccessToken = 'oidc-access-token';
 
     await expect(
       fetchAccessToken(auth, resourceServer, 't1', {
@@ -504,10 +523,9 @@ describe('fetchAccessToken', (): void => {
       (call): boolean => call.url === `${issuer}/requests`,
     );
     expect(requestCalls).toHaveLength(1);
-    expect(requestCalls[0].body).toContain(
-      'sotw:requestedTarget <https://data.example/b>',
-    );
-    expect(requestCalls[0].body).toContain('sotw:requestedAction odrl:read');
+    expect(JSON.parse(requestCalls[0].body)).toEqual({
+      ticket: 'missing-permissions-ticket',
+    });
   });
 
   // Extensibility: an external (custom) resolver that matches several distinct

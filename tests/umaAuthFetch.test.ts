@@ -75,7 +75,7 @@ describe('Auth.createAuthFetch', (): void => {
   it('sends an access request when access is denied and the flag is set', async(): Promise<void> => {
     const resourceUrl = 'http://localhost:3000/demo/private.txt';
     const ticket = umaTicket;
-    const escapedWebId = encodeURIComponent(webId);
+    const deniedTicket = 'denied-ticket';
 
     let accessRequestBody = '';
 
@@ -110,7 +110,7 @@ describe('Auth.createAuthFetch', (): void => {
         response: {
           status: 403,
           headers: { 'content-type': 'application/json' },
-          body: { error: 'request_denied' },
+          body: { error: 'request_denied', ticket: deniedTicket },
         },
       },
       {
@@ -118,8 +118,8 @@ describe('Auth.createAuthFetch', (): void => {
           url: 'http://localhost:4000/uma/requests',
           method: 'POST',
           headers: {
-            authorization: `WebID ${escapedWebId}`,
-            'content-type': 'text/turtle',
+            authorization: `Bearer ${oidcToken.access_token}`,
+            'content-type': 'application/json',
           },
           body: (body: string): boolean => {
             accessRequestBody = body;
@@ -127,29 +127,26 @@ describe('Auth.createAuthFetch', (): void => {
           },
         },
         response: {
-          status: 201,
-          headers: { 'content-type': 'text/turtle' },
+          status: 202,
+          headers: { 'content-type': 'application/json' },
           body: '',
         },
       },
     ]);
 
     const auth = new Auth({ fetch: fetchMock, storage: new MemoryStorage() });
+    auth.oidcAccessToken = oidcToken.access_token;
     auth.oidcToken = oidcToken.id_token;
     auth.webId = webId;
     const authFetch = auth.createAuthFetch();
 
     const response = await authFetch(resourceUrl, undefined, { accessRequest: true });
 
-    expect(response.status).toBe(201);
-    expect(accessRequestBody).toContain('a sotw:EvaluationRequest');
-    expect(accessRequestBody).toContain(`sotw:requestedTarget <${resourceUrl}>`);
-    expect(accessRequestBody).toContain('sotw:requestedAction odrl:read');
-    expect(accessRequestBody).toContain(`sotw:requestingParty <${webId}>`);
-    expect(accessRequestBody).toContain('ex:requestStatus ex:requested');
+    expect(response.status).toBe(202);
+    expect(JSON.parse(accessRequestBody)).toEqual({ ticket: deniedTicket });
   });
 
-  it('maps write methods to odrl:write in access requests', async(): Promise<void> => {
+  it('falls back to the UMA challenge ticket when denial has no ticket', async(): Promise<void> => {
     const resourceUrl = 'http://localhost:3000/demo/private.txt';
     const ticket = umaTicket;
 
@@ -157,7 +154,7 @@ describe('Auth.createAuthFetch', (): void => {
 
     const fetchMock = createMockFetch([
       {
-        request: { url: resourceUrl, method: 'PUT' },
+        request: { url: resourceUrl, method: 'GET' },
         response: {
           status: 401,
           headers: {
@@ -190,24 +187,29 @@ describe('Auth.createAuthFetch', (): void => {
         request: {
           url: 'http://localhost:4000/uma/requests',
           method: 'POST',
+          headers: {
+            authorization: `Bearer ${oidcToken.access_token}`,
+            'content-type': 'application/json',
+          },
           body: (body: string): boolean => {
             accessRequestBody = body;
             return true;
           },
         },
-        response: { status: 201, body: '' },
+        response: { status: 202, body: '' },
       },
     ]);
 
     const auth = new Auth({ fetch: fetchMock, storage: new MemoryStorage() });
+    auth.oidcAccessToken = oidcToken.access_token;
     auth.oidcToken = oidcToken.id_token;
     auth.webId = webId;
     const authFetch = auth.createAuthFetch();
 
-    const response = await authFetch(resourceUrl, { method: 'PUT' }, { accessRequest: true });
+    const response = await authFetch(resourceUrl, undefined, { accessRequest: true });
 
-    expect(response.status).toBe(201);
-    expect(accessRequestBody).toContain('sotw:requestedAction odrl:write');
+    expect(response.status).toBe(202);
+    expect(JSON.parse(accessRequestBody)).toEqual({ ticket });
   });
 
   it('does not send an access request when the flag is not set', async(): Promise<void> => {

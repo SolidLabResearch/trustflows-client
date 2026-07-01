@@ -161,7 +161,7 @@ export interface FailedTokenResponse extends JsonObject {
   /**
    * The required claims to satisfy the authorization request.
    */
-  required_claims?: RequiredClaims[];
+  required_claims?: RequiredClaims | RequiredClaims[];
 
   /**
    * The URI to redirect the user to for interactive authorization, if applicable.

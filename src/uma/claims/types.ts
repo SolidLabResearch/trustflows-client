@@ -53,7 +53,7 @@ export interface ClaimResolutionContext {
   accessRequest?: boolean;
 
   /**
-   * The WebID of the requesting party, required when sending access requests.
+   * The WebID of the requesting party, available to claim resolvers.
    */
   requestingParty?: string;
 }

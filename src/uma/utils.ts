@@ -162,7 +162,14 @@ export async function fetchAccessToken(
       );
     }
 
-    const requiredClaims = errorPayload.required_claims ?? [];
+    const requiredClaims = normalizeRequiredClaims(errorPayload.required_claims);
+    if (hasEmptyClaimTokenFormat(requiredClaims)) {
+      throw new TokenRequestError(
+        'UMA server requested an empty claim token format.',
+        401,
+        errorPayload,
+      );
+    }
     if (requiredClaims.length === 0) {
       throw new TokenRequestError(
         'UMA server requested additional claims but did not specify any.',
@@ -277,17 +284,16 @@ export async function fetchWithUma(
       error.status >= 400 &&
       error.status < 500
     ) {
-      const requestingParty = auth.webId;
-      if (!requestingParty) {
+      const accessToken = auth.oidcAccessToken;
+      if (!accessToken) {
         throw new Error(
-          'Cannot send an access request without a requesting party WebID.',
+          'Cannot send an access request without an OIDC access token.',
         );
       }
       return requestAccess({
         asUri: challenge.as_uri,
-        resourceUrl: resolveRequestUrl(input),
-        requestingParty,
-        method: resolveRequestMethod(input, init),
+        ticket: extractTicket(error.payload) ?? challenge.ticket,
+        accessToken,
         fetchFn,
       });
     }
@@ -305,30 +311,6 @@ export async function fetchWithUma(
 }
 
 /**
- * Maps an HTTP method to the ODRL action used in an access request.
- */
-export function methodToRequestedAction(method: string): string {
-  switch (method.toUpperCase()) {
-    case 'DELETE':
-      return 'odrl:delete';
-    case 'PATCH':
-    case 'POST':
-    case 'PUT':
-      return 'odrl:write';
-    default:
-      return 'odrl:read';
-  }
-}
-
-/**
- * Percent-escapes a requesting party WebID for use in the `Authorization`
- * header of an access request (`:`, `/`, `#`, ... become `%` codes).
- */
-export function escapeWebId(webId: string): string {
-  return encodeURIComponent(webId);
-}
-
-/**
  * Builds the access request endpoint from the authorization server URI, e.g.
  * `http://as.local:4000/uma` becomes `http://as.local:4000/uma/requests`.
  */
@@ -343,26 +325,14 @@ export interface AccessRequestOptions {
   asUri: string;
 
   /**
-   * The resource the requesting party wants access to.
+   * The ticket returned by the authorization server for the denied request.
    */
-  resourceUrl: string;
+  ticket: string;
 
   /**
-   * The WebID of the requesting party.
+   * The requesting party's OIDC access token.
    */
-  requestingParty: string;
-
-  /**
-   * The HTTP method that determines the requested ODRL action. Defaults to
-   * `GET` (i.e. `odrl:read`).
-   */
-  method?: string;
-
-  /**
-   * Explicit ODRL actions to request. When omitted, the action is inferred
-   * from `method`.
-   */
-  requestedActions?: string[];
+  accessToken: string;
 
   /**
    * The fetch implementation to use.
@@ -371,33 +341,16 @@ export interface AccessRequestOptions {
 }
 
 /**
- * Builds the Turtle body of an access request (a `sotw:EvaluationRequest`).
+ * Builds the JSON body of an access request.
  */
 export function buildAccessRequestBody(
-  options: Pick<
-    AccessRequestOptions,
-    'resourceUrl' | 'requestingParty' | 'method' | 'requestedActions'
-  >,
+  options: Pick<AccessRequestOptions, 'ticket'>,
 ): string {
-  const actions = options.requestedActions?.length ?
-    options.requestedActions :
-      [ methodToRequestedAction(options.method ?? 'GET') ];
-  const requestId = `http://example.org/access-request/${randomRequestId()}`;
-  return `@prefix sotw: <https://w3id.org/force/sotw#> .
-@prefix odrl: <http://www.w3.org/ns/odrl/2/> .
-@prefix ex: <http://example.org/> .
-
-<${requestId}> a sotw:EvaluationRequest ;
-  sotw:requestedTarget <${options.resourceUrl}> ;
-  sotw:requestedAction ${actions.join(', ')} ;
-  sotw:requestingParty <${options.requestingParty}> ;
-  ex:requestStatus ex:requested .
-`;
+  return JSON.stringify({ ticket: options.ticket });
 }
 
 /**
- * Sends an access request to the authorization server so the requesting party
- * can ask for access to a resource they currently cannot access.
+ * Sends an access request for a denied UMA ticket.
  */
 export async function requestAccess(
   options: AccessRequestOptions,
@@ -409,8 +362,8 @@ export async function requestAccess(
   return fetchFn(endpoint, {
     method: 'POST',
     headers: {
-      Authorization: `WebID ${escapeWebId(options.requestingParty)}`,
-      'content-type': 'text/turtle',
+      Authorization: `Bearer ${options.accessToken}`,
+      'content-type': 'application/json',
     },
     body,
   });
@@ -418,90 +371,61 @@ export async function requestAccess(
 
 export async function requestDerivedResourceAccess(
   issuer: string,
-  permissions: PermissionDescription[],
   auth: Auth,
   context: ClaimResolutionContext,
+  ticket?: string,
 ): Promise<Response> {
-  const requestingParty = context.requestingParty ?? auth.webId;
-  if (!requestingParty) {
+  const accessToken = auth.oidcAccessToken;
+  if (!accessToken) {
     throw new Error(
-      'Cannot send an access request without a requesting party WebID.',
+      'Cannot send an access request without an OIDC access token.',
     );
   }
-
-  let response: Response | undefined;
-  for (const permission of permissions) {
-    response = await requestAccess({
-      asUri: issuer,
-      resourceUrl: permission.resource_id,
-      requestingParty,
-      requestedActions: scopesToRequestedActions(permission.resource_scopes),
-      fetchFn: auth.getFetch(),
-    });
+  if (!ticket) {
+    throw new Error('Cannot send an access request without a ticket.');
   }
 
-  if (!response) {
-    throw new Error('No derived resource permissions were available to request.');
-  }
-  return response;
+  return requestAccess({
+    asUri: issuer,
+    ticket,
+    accessToken,
+    fetchFn: auth.getFetch(),
+  });
 }
 
-function scopesToRequestedActions(scopes: string[] | undefined): string[] {
-  if (!scopes || scopes.length === 0) {
-    return [ 'odrl:read' ];
+function extractTicket(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') {
+    return undefined;
   }
-
-  return [ ...new Set(scopes.map(scopeToRequestedAction)) ];
+  const ticket = (payload as { ticket?: unknown }).ticket;
+  return typeof ticket === 'string' && ticket ? ticket : undefined;
 }
 
-function scopeToRequestedAction(scope: string): string {
-  const normalized = scope.trim().toLowerCase();
-  if (normalized.includes('delete')) {
-    return 'odrl:delete';
+function normalizeRequiredClaims(
+  requiredClaims: FailedTokenResponse['required_claims'],
+): RequiredClaims[] {
+  if (!requiredClaims) {
+    return [];
   }
-  if (
-    normalized.includes('append') ||
-    normalized.includes('create') ||
-    normalized.includes('update') ||
-    normalized.includes('write')
-  ) {
-    return 'odrl:write';
-  }
-  if (normalized.includes('read') || normalized.includes('view')) {
-    return 'odrl:read';
-  }
-  return scope.includes(':') ? `<${scope}>` : `odrl:${scope}`;
+  return Array.isArray(requiredClaims) ? requiredClaims : [ requiredClaims ];
 }
 
-function resolveRequestUrl(input: RequestInfo | URL): string {
-  if (typeof input === 'string') {
-    return input;
-  }
-  if (input instanceof URL) {
-    return input.toString();
-  }
-  return input.url;
+function hasEmptyClaimTokenFormat(claims: RequiredClaims[]): boolean {
+  return claims.some((claim): boolean =>
+    isEmptyClaimTokenFormat((claim as Record<string, unknown>).claim_token_format));
 }
 
-function resolveRequestMethod(
-  input: RequestInfo | URL,
-  init?: RequestInit,
-): string {
-  if (init?.method) {
-    return init.method;
+function isEmptyClaimTokenFormat(value: unknown): boolean {
+  if (value === undefined) {
+    return false;
   }
-  if (input instanceof Request) {
-    return input.method;
+  if (typeof value === 'string') {
+    return value.trim().length === 0;
   }
-  return 'GET';
-}
-
-function randomRequestId(): string {
-  const cryptoObj = globalThis.crypto as Crypto | undefined;
-  if (cryptoObj?.randomUUID) {
-    return cryptoObj.randomUUID();
+  if (Array.isArray(value)) {
+    return value.every(isEmptyClaimTokenFormat);
   }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return false;
 }
 
 function stableStringify(value: unknown): string {

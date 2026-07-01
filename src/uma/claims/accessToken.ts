@@ -117,9 +117,9 @@ export async function resolveAccessTokenClaims(
     ) {
       error.accessRequestResponse = await requestDerivedResourceAccess(
         issuer,
-        permissions,
         auth,
         context,
+        extractTicket(error.payload),
       );
     }
     throw error;
@@ -136,9 +136,9 @@ export async function resolveAccessTokenClaims(
     );
     error.accessRequestResponse = await requestDerivedResourceAccess(
       issuer,
-      missingPermissions,
       auth,
       context,
+      extractTicket(tokenResult),
     );
     throw error;
   }
@@ -280,6 +280,14 @@ function splitScopeString(value: unknown): string[] | undefined {
   }
   const scopes = value.split(/\s+/u).filter(Boolean);
   return scopes.length > 0 ? scopes : undefined;
+}
+
+function extractTicket(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') {
+    return undefined;
+  }
+  const ticket = (payload as { ticket?: unknown }).ticket;
+  return typeof ticket === 'string' && ticket ? ticket : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
