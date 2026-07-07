@@ -1,7 +1,16 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { describe, expect, it } from 'vitest';
-import type { Auth, Claim, ClaimResolverDefinition } from '../src';
-import { createDefaultClaimResolvers, fetchAccessToken, ID_TOKEN_CLAIM_FORMAT } from '../src';
+import type {
+  Auth,
+  Claim,
+  ClaimResolverDefinition,
+  PermissionDescription,
+} from '../src';
+import {
+  createDefaultClaimResolvers,
+  fetchAccessToken,
+  ID_TOKEN_CLAIM_FORMAT,
+} from '../src';
 
 function makeAuth(
   fetchFn: typeof fetch,
@@ -468,6 +477,7 @@ describe('fetchAccessToken', (): void => {
       const url = requestUrl(input);
       const body = typeof init?.body === 'string' ? init.body : '';
       calls.push({ url, body });
+      const payload = body ? JSON.parse(body) as Record<string, unknown> : {};
 
       if (url === `${issuer}/.well-known/uma2-configuration`) {
         return new Response(
@@ -477,6 +487,18 @@ describe('fetchAccessToken', (): void => {
       }
 
       if (url === `${issuer}/token`) {
+        const requestedPermissions = payload.permissions;
+        if (
+          Array.isArray(requestedPermissions) &&
+          requestedPermissions.length === 1 &&
+          (requestedPermissions[0] as PermissionDescription).resource_id ===
+          'https://data.example/b'
+        ) {
+          return new Response(
+            JSON.stringify({ error: 'access_denied', ticket: 'missing-permissions-ticket' }),
+            { status: 403, headers: { 'content-type': 'application/json' }},
+          );
+        }
         return new Response(
           JSON.stringify({
             access_token: jwt({
@@ -526,6 +548,281 @@ describe('fetchAccessToken', (): void => {
     expect(JSON.parse(requestCalls[0].body)).toEqual({
       ticket: 'missing-permissions-ticket',
     });
+
+    const singlePermissionCalls = calls.filter((call): boolean => {
+      if (call.url !== `${issuer}/token`) {
+        return false;
+      }
+      const body = JSON.parse(call.body) as { permissions?: unknown[] };
+      return body.permissions?.length === 1;
+    });
+    expect(singlePermissionCalls).toHaveLength(1);
+  });
+
+  it('requests access for multiple permissions missing from a derived JWT access token', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const resourceServer = 'https://rs.example/token';
+    const issuer = 'https://as.example';
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/a',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/b',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/c',
+        resource_scopes: [ 'read' ],
+      },
+    ];
+    const calls: { url: string; body: string }[] = [];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body = typeof init?.body === 'string' ? init.body : '';
+      calls.push({ url, body });
+      const payload = body ? JSON.parse(body) as { permissions?: PermissionDescription[] } : {};
+
+      if (url === `${issuer}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuer}/token`, issuer }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/token`) {
+        const [ permission ] = payload.permissions ?? [];
+        if (payload.permissions?.length === 1 && permission) {
+          const suffix = permission.resource_id.endsWith('/b') ? 'b' : 'c';
+          return new Response(
+            JSON.stringify({ error: 'access_denied', ticket: `ticket-${suffix}` }),
+            { status: 403, headers: { 'content-type': 'application/json' }},
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            access_token: jwt({
+              permissions: [
+                {
+                  resource_id: 'https://data.example/a',
+                  resource_scopes: [ 'read' ],
+                },
+              ],
+            }),
+            token_type: 'Bearer',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/requests`) {
+        return new Response('', { status: 202 });
+      }
+
+      return new Response(
+        JSON.stringify({
+          error: 'need_info',
+          required_claims: requiredClaims,
+          ticket: 't2',
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+    auth.oidcAccessToken = 'oidc-access-token';
+
+    await expect(
+      fetchAccessToken(auth, resourceServer, 't1', { accessRequest: true }),
+    ).rejects.toMatchObject({ status: 403 });
+
+    const requestBodies = calls
+      .filter((call): boolean => call.url === `${issuer}/requests`)
+      .map((call): unknown => JSON.parse(call.body));
+    expect(requestBodies).toEqual([
+      { ticket: 'ticket-b' },
+      { ticket: 'ticket-c' },
+    ]);
+
+    const singlePermissionCalls = calls.filter((call): boolean => {
+      if (call.url !== `${issuer}/token`) {
+        return false;
+      }
+      const body = JSON.parse(call.body) as { permissions?: unknown[] };
+      return body.permissions?.length === 1;
+    });
+    expect(singlePermissionCalls).toHaveLength(2);
+  });
+
+  it('does not request access when the derived JWT covers all requested permissions', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const resourceServer = 'https://rs.example/token';
+    const issuer = 'https://as.example';
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/a',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/b',
+        resource_scopes: [ 'write' ],
+      },
+    ];
+    const calls: { url: string; body: string }[] = [];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body = typeof init?.body === 'string' ? init.body : '';
+      calls.push({ url, body });
+
+      if (url === `${issuer}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuer}/token`, issuer }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/token`) {
+        return new Response(
+          JSON.stringify({
+            access_token: jwt({
+              permissions: [
+                {
+                  resource_id: 'https://data.example/a',
+                  resource_scopes: [ 'read' ],
+                },
+                {
+                  resource_id: 'https://data.example/b',
+                  resource_scopes: [ 'write' ],
+                },
+              ],
+            }),
+            token_type: 'Bearer',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/requests`) {
+        throw new Error('Unexpected access request.');
+      }
+
+      const payload = body ? JSON.parse(body) as Record<string, unknown> : {};
+      if (payload.claim_token_format === 'urn:ietf:params:oauth:token-type:access_token') {
+        return new Response(
+          JSON.stringify({ access_token: 'final-access', token_type: 'Bearer' }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          error: 'need_info',
+          required_claims: requiredClaims,
+          ticket: 't2',
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+    auth.oidcAccessToken = 'oidc-access-token';
+
+    const result = await fetchAccessToken(auth, resourceServer, 't1', {
+      accessRequest: true,
+    });
+
+    expect(result).toEqual({ access_token: 'final-access', token_type: 'Bearer' });
+    expect(calls.some((call): boolean => call.url === `${issuer}/requests`))
+      .toBe(false);
+  });
+
+  it('errors when a missing derived permission denial has no ticket', async(): Promise<void> => {
+    const DERIVATION_ACCESS = 'https://w3id.org/aggregator#derivation-access';
+    const resourceServer = 'https://rs.example/token';
+    const issuer = 'https://as.example';
+    const requiredClaims = [
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/a',
+        resource_scopes: [ 'read' ],
+      },
+      {
+        claim_type: DERIVATION_ACCESS,
+        issuer,
+        derivation_resource_id: 'https://data.example/b',
+        resource_scopes: [ 'read' ],
+      },
+    ];
+
+    async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url = requestUrl(input);
+      const body = typeof init?.body === 'string' ? init.body : '';
+      const payload = body ? JSON.parse(body) as { permissions?: PermissionDescription[] } : {};
+
+      if (url === `${issuer}/.well-known/uma2-configuration`) {
+        return new Response(
+          JSON.stringify({ token_endpoint: `${issuer}/token`, issuer }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/token`) {
+        if (payload.permissions?.length === 1) {
+          return new Response(
+            JSON.stringify({ error: 'access_denied' }),
+            { status: 403, headers: { 'content-type': 'application/json' }},
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            access_token: jwt({
+              permissions: [
+                {
+                  resource_id: 'https://data.example/a',
+                  resource_scopes: [ 'read' ],
+                },
+              ],
+            }),
+            token_type: 'Bearer',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' }},
+        );
+      }
+
+      if (url === `${issuer}/requests`) {
+        throw new Error('Unexpected access request.');
+      }
+
+      return new Response(
+        JSON.stringify({
+          error: 'need_info',
+          required_claims: requiredClaims,
+          ticket: 't2',
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' }},
+      );
+    }
+
+    const auth = makeAuth(fetchMock, createDefaultClaimResolvers());
+    auth.oidcAccessToken = 'oidc-access-token';
+
+    await expect(
+      fetchAccessToken(auth, resourceServer, 't1', { accessRequest: true }),
+    ).rejects.toThrow(/without a derived resource denial ticket/u);
   });
 
   // Extensibility: an external (custom) resolver that matches several distinct

@@ -6,12 +6,20 @@ import {
   TokenRequestError,
 } from '../utils';
 import type { Auth } from '../../auth';
-import type { Claim, PermissionDescription, SuccessfulTokenResponse } from '../types';
+import { safeJson } from '../../utils';
+import type {
+  Claim,
+  FailedTokenResponse,
+  PermissionDescription,
+  SuccessfulTokenResponse,
+  TokenRequest,
+} from '../types';
 import type {
   ClaimResolutionContext,
   ClaimResolverDefinition,
   RequiredClaims,
 } from './types';
+import { ID_TOKEN_CLAIM_FORMAT } from './idToken';
 
 export const ACCESS_TOKEN_CLAIM_FORMAT =
   'urn:ietf:params:oauth:token-type:access_token';
@@ -128,17 +136,22 @@ export async function resolveAccessTokenClaims(
     tokenResult.access_token,
     permissions,
   );
-  if (context.accessRequest && missingPermissions && missingPermissions.length > 0) {
+  if (
+    context.accessRequest &&
+    missingPermissions &&
+    missingPermissions.length > 0
+  ) {
     const error = new TokenRequestError(
       'UMA access token is missing requested permissions.',
       403,
       { permissions: missingPermissions },
     );
-    error.accessRequestResponse = await requestDerivedResourceAccess(
+    error.accessRequestResponse = await requestMissingDerivedResourceAccess(
       issuer,
+      endpoint,
+      missingPermissions,
       auth,
       context,
-      extractTicket(tokenResult),
     );
     throw error;
   }
@@ -146,6 +159,60 @@ export async function resolveAccessTokenClaims(
     claim_token: tokenResult.access_token,
     claim_token_format: ACCESS_TOKEN_CLAIM_FORMAT,
   };
+}
+
+async function requestMissingDerivedResourceAccess(
+  issuer: string,
+  tokenEndpoint: string,
+  permissions: PermissionDescription[],
+  auth: Auth,
+  context: ClaimResolutionContext,
+): Promise<Response> {
+  let lastResponse: Response | undefined;
+  for (const permission of permissions) {
+    const ticket = await fetchDeniedPermissionTicket(tokenEndpoint, permission, auth);
+    if (!ticket) {
+      continue;
+    }
+    lastResponse = await requestDerivedResourceAccess(
+      issuer,
+      auth,
+      context,
+      ticket,
+    );
+  }
+  if (!lastResponse) {
+    throw new Error(
+      'Cannot send an access request without a derived resource denial ticket.',
+    );
+  }
+  return lastResponse;
+}
+
+async function fetchDeniedPermissionTicket(
+  tokenEndpoint: string,
+  permission: PermissionDescription,
+  auth: Auth,
+): Promise<string | undefined> {
+  const payload: TokenRequest = {
+    grant_type: 'urn:ietf:params:oauth:grant-type:uma-ticket',
+    permissions: [ permission ],
+    claim_token: await auth.createClaimToken(),
+    claim_token_format: ID_TOKEN_CLAIM_FORMAT,
+  };
+  const response = await auth.getFetch()(tokenEndpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (response.ok) {
+    return undefined;
+  }
+  if (response.status < 400 || response.status >= 500) {
+    return undefined;
+  }
+  const errorPayload = await safeJson<FailedTokenResponse>(response);
+  return extractTicket(errorPayload);
 }
 
 interface GrantedPermission {
